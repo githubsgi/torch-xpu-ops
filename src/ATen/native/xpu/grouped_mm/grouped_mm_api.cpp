@@ -14,9 +14,12 @@
 #include <c10/xpu/XPUStream.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 
 #ifdef USE_SYCLTLA
 #include <ATen/native/xpu/grouped_mm/sycltla/grouped_mm_kernels.h>
@@ -207,22 +210,104 @@ int32_t num_workgroups_from_env() {
   return n > 0 ? int32_t(n) : 0;
 }
 
+void log_plan(
+    const Plan& plan,
+    const at::Tensor& mat_a,
+    const at::Tensor& mat_b,
+    const at::Tensor& out) {
+  const auto& p = plan.params;
+  auto& queue = c10::xpu::getCurrentXPUStream().queue();
+  const int tile = (p.tile == 1 || p.tile == 2)
+      ? p.tile
+      : grouped_gemm::default_tile(queue.get_device());
+  const int wgs = p.num_workgroups > 0
+      ? p.num_workgroups
+      : (num_workgroups_from_env() > 0
+             ? num_workgroups_from_env()
+             : grouped_gemm::default_num_workgroups(queue.get_device()));
+  const char* dt = plan.dtype == grouped_gemm::DType::BF16 ? "bf16" : "fp16";
+  const char* tile_s = tile == 2 ? "256x256" : "256x128";
+  std::string kind = plan.k_grouped
+      ? std::string("k-grouped(2Dx2D)")
+      : std::string("m-grouped(2Dx3D) B=") +
+          (plan.layout_b == 'C' ? "N-contig" : "K-contig");
+  const bool empty = out.numel() == 0 || mat_a.numel() == 0 ||
+      mat_b.numel() == 0;
+  std::string key = std::string("sycltla|") + kind + "|" + dt + "|" +
+      std::to_string(p.N) + "|" +
+      std::to_string(plan.k_grouped ? p.M : p.K) + "|" +
+      std::to_string(p.num_groups) + (empty ? "|empty" : "");
+  std::string line = c10::str(
+      "SYCL-TLA ",
+      kind,
+      " ",
+      dt,
+      empty ? " [empty: zero-fill, no launch]" : "",
+      " tile=",
+      tile_s,
+      " wgs=",
+      wgs,
+      " groups=",
+      p.num_groups,
+      " a",
+      mat_a.sizes(),
+      " b",
+      mat_b.sizes(),
+      " -> out",
+      out.sizes());
+  log_grouped_mm(key, line);
+}
+
 } // namespace
 #endif // USE_SYCLTLA
+
+int grouped_mm_log_level() {
+  const char* v = std::getenv("TORCH_XPU_GROUPED_MM_LOG");
+  if (v == nullptr || v[0] == '\0') {
+    return 0;
+  }
+  return int(std::strtol(v, nullptr, 10));
+}
+
+void log_grouped_mm(const std::string& key, const std::string& line) {
+  const int level = grouped_mm_log_level();
+  if (level <= 0) {
+    return;
+  }
+  static std::mutex mu;
+  static std::unordered_set<std::string> seen;
+  std::lock_guard<std::mutex> guard(mu);
+  if (level == 1 && !seen.insert(key).second) {
+    return;
+  }
+  std::fprintf(stderr, "[xpu grouped_mm] %s\n", line.c_str());
+  std::fflush(stderr);
+}
 
 bool can_use_grouped_mm(
     const at::Tensor& mat_a,
     const at::Tensor& mat_b,
     const at::Tensor& offs,
-    const at::Tensor& out) {
+    const at::Tensor& out,
+    std::string* why_not) {
 #ifndef USE_SYCLTLA
+  if (why_not != nullptr) {
+    *why_not = "torch-xpu-ops built without SYCL-TLA";
+  }
   return false;
 #else
   if (disabled_by_env()) {
+    if (why_not != nullptr) {
+      *why_not = "TORCH_XPU_GROUPED_MM_DISABLE_SYCLTLA is set";
+    }
     return false;
   }
   Plan plan;
-  return build_plan(mat_a, mat_b, offs, out, plan).empty();
+  std::string reason = build_plan(mat_a, mat_b, offs, out, plan);
+  if (why_not != nullptr) {
+    *why_not = reason;
+  }
+  return reason.empty();
 #endif
 }
 
@@ -238,6 +323,9 @@ void grouped_mm(
   Plan plan;
   const std::string reason = build_plan(mat_a, mat_b, offs, out, plan);
   TORCH_CHECK(reason.empty(), "sycltla::grouped_mm: unsupported inputs: ", reason);
+  if (grouped_mm_log_level() > 0) {
+    log_plan(plan, mat_a, mat_b, out);
+  }
   if (out.numel() == 0) {
     return;
   }

@@ -35,7 +35,15 @@ Modes:
   vary_split  new per-expert split every call, total M held fixed
   vary_total  new routing every call, so total M changes too (what training does)
 
-Run:  python grouped_mm.dsv3_16b.py [--ep 8] [--iters 20] [--check] [--json out.json]
+Run:  python grouped_mm.dsv3_16b.py [--ep 8] [--iters 20] [--check] [--print-dispatch] [--json out.json]
+
+--print-dispatch shows (1) the dispatcher's kernel table for aten::_grouped_mm
+(which backend key serves XPU, or that it falls through to the
+CompositeExplicitAutograd per-group loop) and (2) for each op which XPU
+implementation actually runs, using the backend's TORCH_XPU_GROUPED_MM_LOG
+logging (SYCL-TLA plan: kernel, layout, tile, work-groups; or fallback and
+the reason). TORCH_SHOW_DISPATCH_TRACE=1 only works in debug builds or builds
+compiled with -DHAS_TORCH_SHOW_DISPATCH_TRACE; release wheels ignore it.
 Env knobs of the XPU SYCL-TLA backend (if built): TORCH_XPU_GROUPED_MM_FORCE_SYCLTLA=1,
 TORCH_XPU_GROUPED_MM_DISABLE_SYCLTLA=1.
 """
@@ -75,6 +83,10 @@ def parse_args():
     p.add_argument("--check", action="store_true", help="verify vs per-expert torch.mm")
     p.add_argument("--show-calls", action="store_true",
                    help="print the _grouped_mm calls autograd issues for one MoE block")
+    p.add_argument("--print-dispatch", action="store_true",
+                   help="print the dispatcher table for aten::_grouped_mm and, per op and "
+                        "routing, which XPU implementation runs (SYCL-TLA plan or fallback "
+                        "+ reason) via TORCH_XPU_GROUPED_MM_LOG")
     p.add_argument("--json", default="", help="write results to this file")
     return p.parse_args()
 
@@ -283,6 +295,53 @@ def show_calls(prob, counts, device):
         y.backward(torch.ones_like(y))
 
 
+def print_dispatch(prob, device, g_tokens, e_local, gen):
+    """Dispatcher view + XPU implementation choice for each op."""
+    import sys
+
+    print("== dispatcher: kernels registered for aten::_grouped_mm")
+    try:
+        for line in torch._C._dispatch_dump("aten::_grouped_mm").splitlines():
+            if line.strip():
+                print("   " + line)
+    except Exception as e:
+        print("   (unavailable:", e, ")")
+    print("== dispatcher: computed table (relevant keys)")
+    try:
+        keys = ("XPU", "AutogradXPU", "CompositeExplicitAutograd", "CPU", "CUDA")
+        for line in torch._C._dispatch_dump_table("aten::_grouped_mm").splitlines():
+            if line.split(":")[0].strip() in keys:
+                print("   " + line)
+    except Exception as e:
+        print("   (unavailable:", e, ")")
+
+    cases = {
+        "uniform (DSv3 typical)": route("uniform", g_tokens, e_local, gen),
+        "small (64 rows/expert)": torch.full((e_local,), 64, dtype=torch.int64),
+        "all_empty": torch.zeros(e_local, dtype=torch.int64),
+    }
+    print("== XPU implementation per call (TORCH_XPU_GROUPED_MM_LOG=2; lines come from "
+          "the backend on stderr, none if this torch build has no XPU grouped_mm logger)")
+    prev = os.environ.get("TORCH_XPU_GROUPED_MM_LOG")
+    os.environ["TORCH_XPU_GROUPED_MM_LOG"] = "2"
+    try:
+        for cname, counts in cases.items():
+            m, offs = int(counts.sum()), offs_of(counts, device)
+            for name in OPS:
+                print(f"  -- {cname}: {name}  (total M={m})", flush=True)
+                try:
+                    prob.op(name, m, offs)
+                    sync(device)
+                except RuntimeError as e:
+                    print(f"     backend error: {str(e).splitlines()[0][:120]}", flush=True)
+                sys.stderr.flush()
+    finally:
+        if prev is None:
+            os.environ.pop("TORCH_XPU_GROUPED_MM_LOG", None)
+        else:
+            os.environ["TORCH_XPU_GROUPED_MM_LOG"] = prev
+
+
 def backend_info(device):
     info = {"torch": torch.__version__}
     try:
@@ -319,6 +378,9 @@ def main():
                 per_expert_max=g_tokens, total_rows_mean=a.tokens * TOP_K)
     print("== backend:", json.dumps(info))
     results = {"info": info, "routing": [], "sweep": [], "check": {}}
+
+    if a.print_dispatch:
+        print_dispatch(prob, dev, g_tokens, e_local, gen)
 
     if a.show_calls:
         print("== _grouped_mm calls autograd issues for one MoE expert block:")
