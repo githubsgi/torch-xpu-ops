@@ -198,7 +198,16 @@ def sync(device):
 # --------------------------------------------------------------------------
 
 def time_calls(prob, name, schedule, warmup, device):
-    """schedule: list of (m, offs). Returns (mean steady ms, cold first-call ms)."""
+    """schedule: list of (m, offs). Returns (mean steady ms, cold first-call ms);
+    (nan, nan) if the backend raises for any shape in the schedule."""
+    try:
+        return _time_calls(prob, name, schedule, warmup, device)
+    except RuntimeError as e:
+        print(f"     [{name}] backend error: {str(e).splitlines()[0][:120]}")
+        return float("nan"), float("nan")
+
+
+def _time_calls(prob, name, schedule, warmup, device):
     m0, o0 = schedule[0]
     sync(device)
     t = time.perf_counter()
@@ -238,7 +247,11 @@ def check_ops(prob, counts, device):
     m, offs = int(counts.sum()), offs_of(counts, device)
     worst = {}
     for name in OPS:
-        got = prob.op(name, m, offs).float()
+        try:
+            got = prob.op(name, m, offs).float()
+        except RuntimeError as e:  # record backend failures, keep going
+            worst[name] = (float("nan"), 0.0, False, str(e).splitlines()[0][:120])
+            continue
         ref = prob.reference(name, counts)
         if name.endswith("_dW"):
             got = got[: ref.shape[0]]
@@ -318,8 +331,11 @@ def main():
             worst = check_ops(prob, counts, dev)
             results["check"][kind] = {k: list(v) for k, v in worst.items()}
             bad = [k for k, v in worst.items() if not v[2]]
-            print(f"== check[{kind}]: {'OK' if not bad else 'MISMATCH ' + ','.join(bad)}  "
+            print(f"== check[{kind}]: {'OK' if not bad else 'FAIL ' + ','.join(bad)}  "
                   + " ".join(f"{k}={v[0]:.3g}/{v[1]:.3g}" for k, v in worst.items()))
+            for k, v in worst.items():
+                if len(v) > 3:
+                    print(f"     {k}: {v[3]}")
 
     hdr = f"{'routing':9s} {'mode':10s} {'rows/expert min..max':>22s} {'total M':>15s}  " + \
           "  ".join(f"{op:>14s}" for op in OPS) + "   all6_ms  cold_max_ms"
@@ -338,10 +354,10 @@ def main():
             for name in OPS:
                 ms, cold = time_calls(prob, name, sched, a.warmup, dev)
                 flop = sum(prob.flops(name, m) for m, _ in sched) / len(sched)
-                tf = flop / (ms * 1e-3) / 1e12 if ms > 0 else 0.0
+                tf = flop / (ms * 1e-3) / 1e12 if ms > 0 else float("nan")
                 cells.append(f"{ms:7.3f} ({tf:5.1f})")
                 total_ms += ms
-                cold_max = max(cold_max, cold)
+                cold_max = cold if cold != cold else max(cold_max, cold)
                 row["ops"][name] = {"ms": ms, "tflops": tf, "cold_ms": cold}
             row["all6_ms"], row["cold_max_ms"] = total_ms, cold_max
             results["routing"].append(row)
@@ -357,7 +373,7 @@ def main():
             cells, row = [], {"rows_per_expert": m_e, "total": int(counts.sum()), "ops": {}}
             for name in OPS:
                 ms, cold = time_calls(prob, name, sched, a.warmup, dev)
-                tf = prob.flops(name, sched[0][0]) / (ms * 1e-3) / 1e12 if ms > 0 else 0.0
+                tf = prob.flops(name, sched[0][0]) / (ms * 1e-3) / 1e12 if ms > 0 else float("nan")
                 cells.append(f"{ms:7.3f} ({tf:5.1f})")
                 row["ops"][name] = {"ms": ms, "tflops": tf, "cold_ms": cold}
             results["sweep"].append(row)
