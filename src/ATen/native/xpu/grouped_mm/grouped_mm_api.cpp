@@ -241,6 +241,13 @@ void grouped_mm(
   if (out.numel() == 0) {
     return;
   }
+  if (mat_a.numel() == 0 || mat_b.numel() == 0) {
+    // Empty contraction: every group is empty along K (2D x 2D with no rows,
+    // or K == 0). The result is all zeros. Do not launch: data_ptr() of an
+    // empty tensor is nullptr and the kernel would dereference it.
+    out.zero_();
+    return;
+  }
   plan.params.num_workgroups = num_workgroups_from_env();
 
   auto& queue = c10::xpu::getCurrentXPUStream().queue();

@@ -158,8 +158,11 @@ CUTE_DEVICE void gemm_tile(
 
   clear(tCrD);
 
+  // Bounded by k_tile_count: with an empty contraction (K == 0, e.g. an
+  // empty group in the K-grouped kernel) there is nothing to prefetch.
   CUTE_UNROLL
-  for (; prefetch_k < prefetch_dist; prefetch_k++) {
+  for (; prefetch_k < prefetch_dist && prefetch_k < k_tile_count;
+       prefetch_k++) {
     prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
     prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
   }
