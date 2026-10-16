@@ -401,9 +401,11 @@ def main():
 
     hdr = f"{'routing':9s} {'mode':10s} {'rows/expert min..max':>22s} {'total M':>15s}  " + \
           "  ".join(f"{op:>14s}" for op in OPS) + "   all6_ms  cold_max_ms"
-    print("\n== per-op steady time ms (TFLOPS); cold = first call on a new shape")
-    print(hdr)
-    for kind in [r for r in a.routings.split(",") if r]:
+    routings = [r for r in a.routings.split(",") if r]
+    if routings and a.modes:
+        print("\n== per-op steady time ms (TFLOPS); cold = first call on a new shape")
+        print(hdr)
+    for kind in routings:
         for mode in [m for m in a.modes.split(",") if m]:
             sched, counts = build_schedule(kind, mode, a.iters, g_tokens, e_local, gen, dev)
             cmin = min(int(c.min()) for c in counts)
