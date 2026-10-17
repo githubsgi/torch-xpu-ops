@@ -52,6 +52,14 @@ struct CuteElem<DType::FP16> {
   using type = cute::half_t;
 };
 
+// A tile config ("Cfg") provides:
+//   WGTile    Shape<_M, _N, _K>   work-group tile
+//   SGLayout  Layout<...>         sub-group arrangement over the tile
+//   kTileM / kTileN / kTileK      the same numbers as ints
+//   kPrefetchDist                 K tiles prefetched ahead of the mainloop
+// The production instantiations use the two configs below; the standalone
+// tuner (test/microbench/sycltla_grouped_mm_tune) instantiates more.
+//
 // Work-group tile configuration: 256x128x32 tile, 8x2 sub-groups (n-major),
 // each sub-group owning a 32x64 slab of the accumulator.
 struct TileCfg256x128 {
@@ -60,6 +68,7 @@ struct TileCfg256x128 {
   static constexpr int kTileM = 256;
   static constexpr int kTileN = 128;
   static constexpr int kTileK = 32;
+  static constexpr int kPrefetchDist = 3;
 };
 
 // 256x256x32 tile, 8x4 sub-groups (32 sub-groups = 512 threads), each
@@ -70,6 +79,7 @@ struct TileCfg256x256 {
   static constexpr int kTileM = 256;
   static constexpr int kTileN = 256;
   static constexpr int kTileK = 32;
+  static constexpr int kPrefetchDist = 3;
 };
 
 template <class T, class Cfg>
@@ -98,7 +108,7 @@ CUTE_DEVICE auto make_2d_tensor(T* ptr, int rows, int cols, int ld) {
 // transposed), so any of the operands may be row- or column-major. Out-of-
 // bounds rows/columns are zero-filled on load and masked on store, which is
 // what makes ragged group sizes work without padding.
-template <class ATensor, class BTensor, class DTensor, class TiledMMA>
+template <int PrefetchDist, class ATensor, class BTensor, class DTensor, class TiledMMA>
 CUTE_DEVICE void gemm_tile(
     ATensor const& A,
     BTensor const& B,
@@ -152,7 +162,7 @@ CUTE_DEVICE void gemm_tile(
   auto pBgB = thr_prefetch_B.partition_S(gB);
 
   constexpr int barrier_scope = 2;
-  constexpr int prefetch_dist = 3;
+  constexpr int prefetch_dist = PrefetchDist;
   const int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
   int prefetch_k = 0;
 
@@ -271,7 +281,7 @@ struct MGroupedKernel {
           b + int64_t(cur.g) * p.group_stride_b, p.N, p.K, int(p.ldb));
       auto D = make_2d_tensor<'R'>(
           d + int64_t(cur.row_start) * p.ldd, cur.rows, p.N, int(p.ldd));
-      gemm_tile(A, B, D, m_idx, n_idx, mma);
+      gemm_tile<Cfg::kPrefetchDist>(A, B, D, m_idx, n_idx, mma);
     }
   }
 };
@@ -309,7 +319,7 @@ struct KGroupedKernel {
           b + int64_t(cur.row_start) * p.ldb, p.N, cur.rows, int(p.ldb));
       auto D = make_2d_tensor<'R'>(
           d + int64_t(cur.g) * p.group_stride_d, p.M, p.N, int(p.ldd));
-      gemm_tile(A, B, D, m_idx, n_idx, mma);
+      gemm_tile<Cfg::kPrefetchDist>(A, B, D, m_idx, n_idx, mma);
     }
   }
 };

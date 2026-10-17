@@ -196,9 +196,15 @@ std::string build_plan(
   return "only 2D x 3D and 2D x 2D grouped GEMMs are supported";
 }
 
-bool disabled_by_env() {
-  const char* v = std::getenv("TORCH_XPU_GROUPED_MM_DISABLE_SYCLTLA");
-  return v != nullptr && v[0] != '\0' && v[0] != '0';
+// Tuning knob: force the tile config (1 = 256x128, 2 = 256x256); 0/unset
+// picks by device architecture.
+int32_t tile_from_env() {
+  const char* v = std::getenv("TORCH_XPU_GROUPED_MM_TILE");
+  if (v == nullptr || v[0] == '\0') {
+    return 0;
+  }
+  const long t = std::strtol(v, nullptr, 10);
+  return (t == 1 || t == 2) ? int32_t(t) : 0;
 }
 
 int32_t num_workgroups_from_env() {
@@ -217,8 +223,9 @@ void log_plan(
     const at::Tensor& out) {
   const auto& p = plan.params;
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
-  const int tile = (p.tile == 1 || p.tile == 2)
-      ? p.tile
+  const int env_tile = tile_from_env();
+  const int tile = (p.tile == 1 || p.tile == 2) ? p.tile
+      : env_tile != 0 ? env_tile
       : grouped_gemm::default_tile(queue.get_device());
   const int wgs = p.num_workgroups > 0
       ? p.num_workgroups
@@ -296,12 +303,6 @@ bool can_use_grouped_mm(
   }
   return false;
 #else
-  if (disabled_by_env()) {
-    if (why_not != nullptr) {
-      *why_not = "TORCH_XPU_GROUPED_MM_DISABLE_SYCLTLA is set";
-    }
-    return false;
-  }
   Plan plan;
   std::string reason = build_plan(mat_a, mat_b, offs, out, plan);
   if (why_not != nullptr) {
@@ -337,6 +338,7 @@ void grouped_mm(
     return;
   }
   plan.params.num_workgroups = num_workgroups_from_env();
+  plan.params.tile = tile_from_env();
 
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
   using grouped_gemm::DType;

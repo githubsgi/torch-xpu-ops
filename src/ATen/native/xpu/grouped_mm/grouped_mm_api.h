@@ -37,6 +37,11 @@ bool can_use_grouped_mm(
     const at::Tensor& out,
     std::string* why_not = nullptr);
 
+// Tuning knobs read on every call: TORCH_XPU_GROUPED_MM_TILE (1 = 256x128,
+// 2 = 256x256) and TORCH_XPU_GROUPED_MM_NUM_WORKGROUPS (persistent grid size).
+// Backend selection (SYCL-TLA vs oneDNN vs fallback) is the caller's job; in
+// PyTorch see TORCH_XPU_GROUPED_MM_BACKEND in aten/src/ATen/native/xpu/GroupedBlas.cpp.
+//
 // Runs the grouped GEMM on the current XPU stream. Requires
 // can_use_grouped_mm() to hold; `out` is fully overwritten.
 void grouped_mm(

@@ -44,8 +44,11 @@ implementation actually runs, using the backend's TORCH_XPU_GROUPED_MM_LOG
 logging (SYCL-TLA plan: kernel, layout, tile, work-groups; or fallback and
 the reason). TORCH_SHOW_DISPATCH_TRACE=1 only works in debug builds or builds
 compiled with -DHAS_TORCH_SHOW_DISPATCH_TRACE; release wheels ignore it.
-Env knobs of the XPU SYCL-TLA backend (if built): TORCH_XPU_GROUPED_MM_FORCE_SYCLTLA=1,
-TORCH_XPU_GROUPED_MM_DISABLE_SYCLTLA=1.
+Env knobs of the XPU backend (if built):
+  TORCH_XPU_GROUPED_MM_BACKEND=auto|sycltla|onednn|fallback   force a backend
+  TORCH_XPU_GROUPED_MM_TILE=1|2, TORCH_XPU_GROUPED_MM_NUM_WORKGROUPS=N   SYCL-TLA tuning
+  TORCH_XPU_GROUPED_MM_LOG=1|2   print the backend decision per distinct call / every call
+For kernel tuning without PyTorch see sycltla_grouped_mm_tune/.
 """
 
 import argparse
@@ -351,7 +354,8 @@ def backend_info(device):
         info["xpu_kernel"] = "unknown"
     lib = os.path.join(os.path.dirname(torch.__file__), "lib")
     info["sycltla_lib"] = any("sycltla" in f for f in os.listdir(lib))
-    for k in ("TORCH_XPU_GROUPED_MM_FORCE_SYCLTLA", "TORCH_XPU_GROUPED_MM_DISABLE_SYCLTLA"):
+    for k in ("TORCH_XPU_GROUPED_MM_BACKEND", "TORCH_XPU_GROUPED_MM_TILE",
+              "TORCH_XPU_GROUPED_MM_NUM_WORKGROUPS"):
         if os.environ.get(k):
             info[k] = os.environ[k]
     if device == "xpu":
