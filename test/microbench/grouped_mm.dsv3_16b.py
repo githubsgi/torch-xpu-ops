@@ -30,12 +30,27 @@ and receives tokens from all EP ranks via variable all_to_all splits:
   * the per-rank total M = sum(m_e) averages T * top_k = 49152 and changes on
     every call when EP > 1 (it is exactly T * top_k when EP = 1).
 
+Presets (--preset):
+  recipe   EP=8, 8192 tokens per rank: the torchtitan DSv3 16B test recipe
+           (8 local experts, ~6k rows per expert)
+  tp4ep4   EP=4, 512 tokens per rank: the measured layout from a torchtitan run
+           with PPN=8 TP=4 EP=4 SEQ=2048 TOKENS=2048 (16 local experts, ~190
+           rows per expert). Also enables --profiled.
+
+--profiled adds cases built from the grouped_mm calls recorded in that run's
+Kineto profile (steps 25-27, all 8 ranks; per-rank total M from 187 to 6361,
+median 3053): one static case per quantile and one "step" case that replays
+the 26 per-layer row counts of rank 0, step 25. The profile records total M
+but not the per-expert split, so each total is split across the local
+experts with the uniform router.
+
 Modes:
   static      one routing reused every call (fixed shapes, best case)
   vary_split  new per-expert split every call, total M held fixed
   vary_total  new routing every call, so total M changes too (what training does)
 
-Run:  python grouped_mm.dsv3_16b.py [--ep 8] [--iters 20] [--check] [--print-dispatch] [--json out.json]
+Run:  python grouped_mm.dsv3_16b.py [--preset recipe|tp4ep4] [--ep N] [--tokens T] [--profiled]
+                                   [--iters 20] [--check] [--print-dispatch] [--json out.json]
 
 --print-dispatch shows (1) the dispatcher's kernel table for aten::_grouped_mm
 (which backend key serves XPU, or that it falls through to the
@@ -69,12 +84,36 @@ SEQS_PER_MICROBATCH = 4  # num_tokens_per_microbatch_per_dp_rank = 4 * seq_len
 
 OPS = ["w13_fwd", "w2_fwd", "w13_dX", "w2_dX", "w13_dW", "w2_dW"]
 
+PRESETS = {
+    "recipe": {"ep": 8, "tokens": SEQS_PER_MICROBATCH * SEQ_LEN},
+    # TOKENS=2048 per DP group, sequence parallel over TP=4 -> 512 tokens per rank
+    "tp4ep4": {"ep": 4, "tokens": 512},
+}
+
+# grouped_mm row counts measured with Kineto in torchtitan-githubsgi, DSv3 16B,
+# PPN=8 TP=4 EP=4 SEQ=2048 TOKENS=2048, steps 25-27, all 8 ranks (2026-10-23,
+# torch216_sycltla_ggemm_p312). M = rows routed to one rank, over its 16 experts.
+PROFILED_TP4EP4 = {
+    "ep": 4,
+    "quantiles": {"min": 187, "p10": 2296, "p25": 2794, "p50": 3053,
+                  "p75": 3355, "p90": 3846, "max": 6361},
+    # per-layer M of the 26 MoE layers, rank 0, training step 25
+    "step": [5288, 3626, 3526, 3015, 3559, 3075, 3806, 2667, 3617, 3742, 3035,
+             2912, 2966, 3563, 2964, 2865, 3310, 2539, 3088, 3005, 2856, 3432,
+             2991, 2945, 3099, 2965],
+}
+
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--ep", type=int, default=8, help="expert-parallel degree")
-    p.add_argument("--tokens", type=int, default=SEQS_PER_MICROBATCH * SEQ_LEN,
-                   help="tokens per rank per microbatch (T)")
+    p.add_argument("--preset", choices=sorted(PRESETS), default="recipe",
+                   help="EP / tokens layout (see the module docstring)")
+    p.add_argument("--profiled", action="store_true",
+                   help="add the cases measured in the torchtitan TP4/EP4 profile")
+    p.add_argument("--ep", type=int, default=None,
+                   help="expert-parallel degree (default: from --preset)")
+    p.add_argument("--tokens", type=int, default=None,
+                   help="tokens per rank per microbatch, T (default: from --preset)")
     p.add_argument("--routings", default="balanced,uniform,skewed,hot,sparse")
     p.add_argument("--modes", default="static,vary_split,vary_total")
     p.add_argument("--sweep", default="0,8,64,256,1024,2048,4096,6144,12288,24576,49152",
@@ -124,6 +163,21 @@ def route(kind, g_tokens, e_local, gen):
         logits[:, dead] = -1.0
         return _topk_counts(logits, e_local)
     raise ValueError(f"unknown routing {kind}")
+
+
+def split_like_router(total, g_tokens, e_local, gen):
+    """Split a measured per-rank total M across the local experts with the
+    proportions of a uniform-router draw (the profile has totals only)."""
+    if total == 0:
+        return torch.zeros(e_local, dtype=torch.int64)
+    w = route("uniform", g_tokens, e_local, gen).double()
+    w = w / w.sum() if w.sum() > 0 else torch.full((e_local,), 1.0 / e_local, dtype=torch.double)
+    raw = w * total
+    c = raw.floor().to(torch.int64)
+    rem = total - int(c.sum())
+    if rem:
+        c[torch.argsort(raw - c.double(), descending=True)[:rem]] += 1
+    return c
 
 
 def resplit(total, e_local, gen):
@@ -366,6 +420,13 @@ def backend_info(device):
 def main():
     a = parse_args()
     dev = a.device
+    preset = PRESETS[a.preset]
+    a.ep = a.ep if a.ep is not None else preset["ep"]
+    a.tokens = a.tokens if a.tokens is not None else preset["tokens"]
+    profiled = a.profiled or a.preset == "tp4ep4"
+    if profiled and a.ep != PROFILED_TP4EP4["ep"]:
+        print(f"== note: profiled cases were measured with EP={PROFILED_TP4EP4['ep']}, "
+              f"running them with EP={a.ep}")
     assert NUM_EXPERTS % a.ep == 0
     e_local = NUM_EXPERTS // a.ep
     g_tokens = a.ep * a.tokens
@@ -375,13 +436,16 @@ def main():
     # Upper bound on rows we may need: hot routing or the largest sweep point.
     m_max = max([g_tokens * min(TOP_K, e_local)] + [s * e_local for s in sweep])
     m_max = min(m_max, g_tokens * TOP_K)  # can never exceed all routed copies
+    if profiled:
+        m_max = max(m_max, PROFILED_TP4EP4["quantiles"]["max"], max(PROFILED_TP4EP4["step"]))
     prob = Problem(e_local, m_max, dev)
 
     info = backend_info(dev)
-    info.update(ep=a.ep, e_local=e_local, tokens_per_rank=a.tokens, global_tokens=g_tokens,
+    info.update(preset=a.preset, profiled=profiled,
+                ep=a.ep, e_local=e_local, tokens_per_rank=a.tokens, global_tokens=g_tokens,
                 per_expert_max=g_tokens, total_rows_mean=a.tokens * TOP_K)
     print("== backend:", json.dumps(info))
-    results = {"info": info, "routing": [], "sweep": [], "check": {}}
+    results = {"info": info, "routing": [], "sweep": [], "profiled": [], "check": {}}
 
     if a.print_dispatch:
         print_dispatch(prob, dev, g_tokens, e_local, gen)
@@ -446,6 +510,38 @@ def main():
                 row["ops"][name] = {"ms": ms, "tflops": tf, "cold_ms": cold}
             results["sweep"].append(row)
             print(f"{m_e:11d} {int(counts.sum()):8d}  " + "  ".join(f"{c:>14s}" for c in cells))
+
+    if profiled:
+        print("\n== profiled shapes (torchtitan DSv3 16B TP4/EP4 Kineto, steps 25-27); "
+              "per-op ms (TFLOPS)")
+        print(f"{'case':10s} {'total M':>13s} {'rows/expert':>13s}  "
+              + "  ".join(f"{op:>14s}" for op in OPS) + "   all6_ms")
+        # own generator so the splits do not depend on which other sections ran
+        pgen = torch.Generator(device="cpu").manual_seed(a.seed + 1)
+        pcases = [(k, [v]) for k, v in PROFILED_TP4EP4["quantiles"].items()]
+        pcases.append(("step25", PROFILED_TP4EP4["step"]))
+        for label, totals in pcases:
+            counts = [split_like_router(t, g_tokens, e_local, pgen) for t in totals]
+            reps = max(1, a.iters // len(totals)) if len(totals) > 1 else a.iters
+            sched = [(int(c.sum()), offs_of(c, dev)) for c in counts] * reps
+            tmin, tmax = min(totals), max(totals)
+            cmin = min(int(c.min()) for c in counts)
+            cmax = max(int(c.max()) for c in counts)
+            cells, total_ms = [], 0.0
+            row = {"case": label, "totals": totals, "rows_min": cmin, "rows_max": cmax, "ops": {}}
+            for name in OPS:
+                ms, cold = time_calls(prob, name, sched, a.warmup, dev)
+                flop = sum(prob.flops(name, m) for m, _ in sched) / len(sched)
+                tf = flop / (ms * 1e-3) / 1e12 if ms > 0 else float("nan")
+                cells.append(f"{ms:7.3f} ({tf:5.1f})")
+                total_ms += ms
+                row["ops"][name] = {"ms": ms, "tflops": tf, "cold_ms": cold}
+            row["all6_ms"] = total_ms
+            results["profiled"].append(row)
+            tot = f"{tmin}" if tmin == tmax else f"{tmin}..{tmax}"
+            print(f"{label:10s} {tot:>13s} {f'{cmin}..{cmax}':>13s}  "
+                  + "  ".join(f"{c:>14s}" for c in cells) + f"  {total_ms:8.3f}")
+        print("(step25 replays the 26 per-layer totals in order; times are per call, averaged)")
 
     if a.json:
         with open(a.json, "w") as f:
