@@ -1,0 +1,404 @@
+# Knowledge base for the SYCL-TLA persistent grouped GEMM on Intel PVC (Data Center GPU Max 1550, one tile).
+#
+# Ported from Xe-Forge's knowledge_base/sycl/xpu/{sycl_tla_patterns,cutlass_sycl_framework,resource_feedback}.yaml
+# (BMG numbers replaced by PVC ones) plus facts measured on this kernel.
+# Section references like "notes 11.4" are to
+#   ~/datavol/logs/torchtitan/outputs_deepseek_v3_16b/notes_ggemm.txt
+# "kernel" = src/ATen/native/xpu/grouped_mm/sycltla/grouped_mm_kernel_impl.h; "tla" = /mnt/aimod/subratag/sycl-tla (v0.9).
+# Entries are priors and measurements of OTHER runs: they never replace a measurement of the candidate in front of you.
+# Following Xe-Forge, ignore any "expected speedup" as a promise; the evaluator decides.
+
+constraints:
+  - id: abi_fixed
+    name: Params and grouped_mm_kernels.h are a fixed ABI
+    severity: critical
+    stages: [all]
+    description: |
+      torch calls run_m_grouped / run_k_grouped with the fixed Params struct (a, b, d, offs, M, N, K, lda, ldb, ldd,
+      group_stride_b, group_stride_d, num_groups, num_workgroups, ...). There is no workspace pointer: no scratch
+      memory, no flags in global memory, no atomics against a buffer you allocate, no sycl::malloc_*, no queue
+      memcpy/memset/wait in the launch path. Everything a work-group needs must come from Params and the device
+      `offs` array. Designs that need scratch (classic stream-K with partial-tile fixup, split-K with an fp32
+      reduction buffer) are out of scope. grouped_mm_kernels.h is not part of the candidate and cannot change.
+
+  - id: rank_independent_choice
+    name: Tile and config must not depend on host-known routed row counts
+    severity: critical
+    stages: [all]
+    description: |
+      Every expert-parallel rank must run the same kernel (notes 19.2: a size heuristic that ran different kernels on
+      different ranks was removed; mixed mode produced GPU write faults). A configs.json entry or a code path chosen
+      from avg rows per group, M, or case name is a violation. Logic on the DEVICE that reads `offs` (for example, a
+      per-group branch inside the kernel) is allowed. Do not special-case benchmark shapes, case names, or magic
+      constants of the evaluator: the verification cases are hidden and use new seeds and non-DSv3 shapes.
+
+  - id: numerics_contract
+    name: fp32 accumulation, bf16 output, same math
+    severity: critical
+    stages: [all]
+    description: |
+      Accumulate in fp32 (XE_DPAS_TT<M, float, T, T>), convert once to bf16 on store. Ragged groups, empty groups,
+      single rows, all-empty input, and sizes around tile edges must work with no padding (loads zero-fill out of
+      bounds, stores mask). The evaluator checks the full output against an fp32 reference inside NaN sentinels, so
+      an out-of-bounds or missing write fails.
+
+  - id: candidate_contract
+    name: Candidate header contract (common/eval/cand_cfg.cpp)
+    severity: critical
+    stages: [all]
+    description: |
+      The header must keep providing, in namespace sycltla::grouped_gemm:
+        run_m_grouped_cfg<Cfg, DType dt, char LayoutB>(sycl::queue&, const Params&, int num_wgs)
+        run_k_grouped_cfg<Cfg, DType dt>(sycl::queue&, const Params&, int num_wgs)
+        TiledMmaFor<T, Cfg>   (work-group size = size(TiledMmaFor<T,Cfg>{}) unless Cfg::kThreads exists)
+      Cfg is generated from configs.json per kind (m_rowB forward, m_colB grad_input, k_grouped grad_weight) with
+      WGTile, SGLayout, kTileM/N/K, kPrefetchDist, kDesc; an optional "extra" string appends C++ members (for example
+      `static constexpr int kSplitK = 2;`) and an optional "body" string replaces the whole struct body. The
+      production dispatchers run_m_grouped/run_k_grouped (choose_tile) are not used by the evaluator, only *_cfg.
+      Keep the kernel names unique per Cfg (they are templates on Cfg, so they are). "wgs": 0 means the production
+      grid rule (Xe cores x 512 / work-group threads = 56 for 512-thread WGs on a PVC tile).
+
+  - id: dpas_atom
+    name: DPAS atom and sub-group size
+    severity: critical
+    stages: [device_specific, memory_access, algorithmic]
+    description: |
+      The kernel uses sub_group_size<16> and MMA_Atom<XE_DPAS_TT<8, float, T, T>> (tla include/cute/arch/mma_xe.hpp).
+      One DPAS covers M=8 rows x N=16 columns x K=16 (for 16-bit inputs: K = 256 / 16 bits). XE_DPAS_TT<M,...> also
+      exists for M = 1,2,4 (M=8 is the full-rate shape). So the per-sub-group tile must be a multiple of 8x16 (the
+      evaluator rejects anything else) and the WG tile = SGLayout x per-SG tile; at most 64 sub-groups (1024 work-items)
+      per work-group. Production: 32x64 per sub-group (8 x 4 DPAS blocks = 32 accumulator fragments of 8x16 fp32).
+
+  - id: grf_and_residency
+    name: GRF mode, threads and work-groups per Xe core
+    severity: high
+    stages: [device_specific, persistent_kernel]
+    description: |
+      Production launches grf_size<256> (large GRF): a PVC Xe core (8 XVEs; 448 XVEs per tile in FLAT mode = 56 Xe
+      cores) then holds 32 sub-group threads = 512 work-items, so one 512-thread WG (256x256 tile, 8x4 sub-groups)
+      fills an Xe core and the default persistent grid is 56 work-groups (grouped_mm_kernels.h default_num_workgroups,
+      notes 16.1; 128x256 tiles = 256 threads -> 112 WGs, 128x128 -> 224). With grf_size<128> an XVE holds twice as
+      many threads but half the registers per thread. A 32x64 fp32 accumulator per sub-group is 2048 values / 16
+      lanes = 128 GRF registers per thread (derived: one 64-byte GRF register holds one fp32 per lane), i.e. half of
+      the 256-register file before A/B fragments: a 32x64 per-SG tile cannot fit grf_size<128>. The build summary reports register
+      spills ("register spills" line of ggemm-eval); any spill in the mainloop is a regression until proven otherwise.
+      Changing the launch properties (launch() in the header) is allowed; keep sub_group_size<16>.
+
+  - id: xe_2d_block_limits
+    name: Xe 2D block message limits (what copy atoms can exist)
+    severity: high
+    stages: [memory_access]
+    description: |
+      From tla include/cute/atom/copy_traits_xe_2d.hpp and include/cute/arch/copy_xe_2d.hpp:
+      XE_LOAD_2D<Bits, Height, Width, BlockWidth> (regular), XE_LOAD_2D_VNNI<...> (8/16-bit only; used when the MMA
+      wants a VNNI-packed B), XE_LOAD_2D_TRANSPOSE<Bits, Height, Width> (32- or 64-bit elements only, Width <= 8;
+      16-bit data is loaded as 32-bit pairs), XE_STORE_2D<Bits, Height, Width> (Height <= 8), XE_PREFETCH_2D.
+      Automatic selection (block_2d_selector): load height up to 32 rows, width up to 64 bytes per block row (32
+      bf16) and up to 4 blocks side by side; stores are limited to height 8 and block width. The kind of load
+      (regular / VNNI / transpose) is chosen from the global strides: a unit-stride dimension along the MMA's K for A
+      gives a regular load; a unit stride along M for A (col-major A, as in the K-grouped kernel and the 'C' layouts)
+      needs the transpose path. Out-of-bounds elements are zero-filled by hardware on loads and clipped on stores,
+      which is what makes ragged groups work.
+
+  - id: sg_barrier_api
+    name: Split barriers in the mainloop
+    severity: medium
+    stages: [device_specific]
+    description: |
+      The mainloop brackets each K iteration with barrier_arrive(2) ... barrier_wait(2) (tla
+      include/cute/util/xe_split_barrier.hpp; scope 2 = ScopeWorkgroup, 3 = ScopeSubgroup, 4 = ScopeInvocation).
+      Split barriers keep sub-groups of a work-group within one K step of each other so that shared L1/L3 lines
+      loaded by one sub-group's prefetch are still resident for the others. There is no SLM in the kernel. Removing
+      the barrier, or moving the arrive/wait apart, changes memory behavior and sync stalls (rule `sync` in the
+      profile digest), not correctness; measure it. Never remove a barrier that guards SLM or shared state if you add some.
+
+facts:
+  - id: production_config
+    name: Production configuration (PVC)
+    source: "notes 0, 16.1, 17.1, 19.2; grouped_mm_util.cpp"
+    text: |
+      All three kinds run TileCfg256x256: WGTile 256x256x32, SGLayout 8x4 (n-major), 32x64 per sub-group, prefetch 3,
+      grf_size<256>, sub_group_size<16>, 56 persistent work-groups (one per Xe core), tile ids linearized m-fastest
+      within a group, groups walked in order, work-group w takes tiles w, w+56, ... (GroupCursor/Scheduler). Auto tile
+      choice by row count was removed (19.2).
+
+  - id: per_op_tflops
+    name: Per-op throughput of production (one tile, bf16, uniform routing)
+    source: "notes 22.2"
+    text: |
+      TP4/EP4 (16 experts, ~190 rows each): w13_fwd 137, w2_fwd 126, w13_dX 127, w2_dX 131, w13_dW 84, w2_dW 88 TFLOPS.
+      EP8 (8 experts, ~6k rows each): w13_fwd 142, w2_fwd 137, w13_dX 155, w2_dX 143, w13_dW 138, w2_dW 129 TFLOPS.
+      Practical bf16 ceiling measured with a large dense GEMM is ~220-250 TFLOPS per tile (notes 11.3). The
+      grouped GEMM is at ~55-60% (dX), ~50% (fwd), ~40% (grad_weight at small groups) of that.
+      At ~6k rows/expert the fallback's dense per-group GEMMs are 4-13% faster than this kernel (22.2): the
+      large-group regime has headroom of that size.
+
+  - id: profile_findings
+    name: What unitrace / VTune / Advisor said about production
+    source: "notes 11.1-11.4"
+    text: |
+      dX (M-grouped N-contig): XVE active 73%, stall 7%, occupancy 41%, XMX util 70%, SBID 7%.
+      fwd (M-grouped K-contig): active 70%, stall 9%, XMX 65%, SBID 14% (twice dX).
+      grad_weight (K-grouped): active 55%, stall 33%, XMX 36%, SBID 31% of stall samples, HBM rd ~184 GB/s, L3 rd ~723 GB/s.
+      None of the three is bound by HBM (15-18% of GTI) or L3 (36-52%): the headroom is latency, tile fill and
+      waves. M-grouped kernels are 28-33% IDLE (VTune) at ~190 rows/expert: every expert fills a 256-row tile ~74%
+      and 16 experts x N/256 tiles over 56 work-groups leave a partly empty last wave.
+      grad_weight: each expert gives only ~190 rows of K = ~6 K tiles of 32, so the mainloop cannot hide the
+      prefetch prologue (prefetch 3) and the 256x256 write.
+
+  - id: tile_sweep_small_groups
+    name: Tile sweeps at small groups
+    source: "notes 16.2, 17.2"
+    text: |
+      Forward / grad_input, 16 experts: 128x256 (sg 4x4, 256 threads, 112 WGs) is the fastest tile from 16 to 128
+      rows per expert (5-43% over 128x128, up to 42% over 256-row tiles); from ~160 rows the 256-row tiles win; at
+      ~190 rows 128x256 loses ~10%. 128x128 wins grad_input at 8 rows/expert and loses from 128 rows up.
+      grad_weight: all four tiles within a few % (sweep noise ~10%); prefetch distance 2 won grad_weight in the
+      tuner; 128x128 won w2_dW at the routed TP4/EP4 shapes by ~10% in one sweep but lost at 8 experts.
+      These tile choices cannot depend on row counts (rank_independent_choice), so a static per-kind tile must be a
+      compromise for the whole range of routed counts unless the kernel adapts on the device.
+
+  - id: forward_vs_dx
+    name: Forward is slower than dX
+    source: "notes 11.4"
+    text: |
+      m_rowB (B K-contiguous view) stalls twice as much as m_colB (SBID 14% vs 7%), consistent with an 8-18%
+      forward penalty measured earlier: the K-contiguous B has to be transposed/VNNI-packed on load.
+
+  - id: noise
+    name: Measurement noise
+    source: "common/README.md"
+    text: |
+      Production against itself scores 0.98-1.03 per TP4/EP4 case, +-0.2% per EP8 case. Less than 2% is noise.
+      A tuner sweep has ~10% run-to-run noise on single points; only the paired evaluator ratios count.
+
+api:
+  - id: kernel_structure
+    name: Structure of the kernel in the header
+    text: |
+      gemm_tile<PrefetchDist>(A, B, D, m_idx, n_idx, mma): A is (M,K), B is (N,K), D is (M,N) cute tensors built by
+      make_2d_tensor<'R'|'C'>(ptr, rows, cols, ld). Per tile: identity tensors -> local_tile (gA, gB, gD) ->
+      tiled_copy_a/b/d = get_block_2d_copy_A/B/D<void>(mma, tensor) -> thr slices (local_id = linear WI id) ->
+      fragments (partition_sg_fragment_A/B/C, partition_sg_fragment_D for copies, partition_sg_fragment_S for the
+      store) -> prefetch tilers make_block_2d_prefetch(tiled_copy) -> prologue prefetch of `prefetch_dist` K tiles ->
+      loop { barrier_arrive(2); copy(a), copy(b) into registers; prefetch k+dist; reorder(tArA,tCrA);
+      reorder(tBrB,tCrB); cute::gemm(mma, tCrA, tCrB, tCrD); barrier_wait(2) } -> reorder(tCrD, tCrD_final) ->
+      copy(tiled_copy_d, ...). K tiles beyond the group's K are zero-filled by the block loads.
+      MGroupedKernel (forward/dX): A rows = the group's rows, B = N x K per group (LayoutB 'R' K-contiguous, 'C' N-contig).
+      KGroupedKernel (grad_weight): A = (M, rows) col-major view, B = (N, rows) col-major view, D = (M, N) per group,
+      i.e. the contraction runs over each group's rows; empty groups contribute zero tiles (K == 0 must still write 0).
+
+  - id: scheduler
+    name: GroupCursor and Scheduler
+    text: |
+      One work-group walks the same group sequence: describe(cursor) reads offs[g-1], offs[g] -> row_start, rows,
+      tiles_m, tiles = tiles_m * ceil(N/TileN); locate(linear, cursor, m_idx, n_idx) advances groups while
+      tile_start + tiles <= linear, then m_idx = local % tiles_m, n_idx = local / tiles_m. Tile indices handed to one
+      work-group only increase, so the cursor is amortized. K-grouped: m = fixed_m (Params.M), tiles_m = ceil(M/TileM)
+      independent of rows, so a group with rows == 0 still produces tiles (they write zeros).
+
+  - id: cute_names
+    name: CuTe / SYCL-TLA names that exist (v0.9)
+    text: |
+      TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, T, T>>, Layout<WGTile>, SGLayout>::TiledMMA
+      get_block_2d_copy_A<CopyOp|void>(tiled_mma, tensor), get_block_2d_copy_B, get_block_2d_copy_C/D;
+      make_block_2d_copy_A/B/CD(CopyOp{}, tiled_mma, tensor) with explicit ops
+      XE_LOAD_2D<Bits,Height,Width,BlockWidth>, XE_LOAD_2D_VNNI<...>, XE_LOAD_2D_TRANSPOSE<Bits,Height,Width>,
+      XE_STORE_2D<Bits,Height,Width>, XE_PREFETCH_2D<Bits,Height,Width>;
+      make_block_2d_prefetch(tiled_copy) or make_block_2d_prefetch<ValType, SGCount>(shape, stride/gmem tensor);
+      prefetch(prefetch_atom, tensor), copy(tiled_copy, src, dst), reorder(src_frag, dst_frag), cute::gemm(mma, A, B, C);
+      thr_mma.partition_sg_fragment_A/B/C, thr_copy.partition_sg_fragment_D/S, partition_S/partition_D;
+      barrier_arrive(scope)/barrier_wait(scope) from cute/util/xe_split_barrier.hpp;
+      sycl::ext::oneapi::this_work_item::get_nd_item<3>(); compat helpers in cute/util/compat.hpp.
+      Look at the headers under refs/sycl-tla/ in your workspace before using a name that is not in the kernel.
+      Example kernels in tla: examples/12_xe20_moe_gemm_cute_interface (this kernel's ancestor: moe_grouped_gemm.hpp,
+      moe_tile_scheduler.hpp), examples/04_bmg_grouped_gemm, examples/03_bmg_gemm_streamk.
+
+patterns:
+  - id: prefetch_distance_sweep
+    name: Prefetch distance in K tiles
+    stage: memory_access
+    description: kPrefetchDist K tiles are prefetched ahead of the loads
+    rationale: |
+      Too short leaves loads exposed (SBID stalls); too long wastes bandwidth, cache and the prologue on short K.
+      grad_weight at ~6 K tiles per group spends a large share of the mainloop in the prologue (notes 11.4), where
+      the tuner preferred 2. M-grouped kinds have long K (2048/1408) and were tuned to 3.
+    try: |
+      Per-kind prefetch in configs.json (cheap). Code variant: prefetch_dist as min(Cfg::kPrefetchDist, k_tile_count),
+      or issue the prologue prefetches before computing addresses of the first copy.
+    evidence: "notes 11.4, 22.2"
+
+  - id: k_tile_32_vs_64
+    name: K tile of the work-group
+    stage: memory_access
+    description: WGTile K extent (kTileK), 32 in production
+    rationale: |
+      A larger K tile (64) halves barriers and loop overhead per FLOP and issues more loads per iteration, at the cost
+      of A/B fragment registers (2x) and a longer prologue. 16 is the DPAS K for bf16, so tile K must be a multiple of
+      16. For the K-grouped kernel the K extent of the tile is the unit of padding for each group's contraction (a
+      group with 190 rows pads to 192 with K=32: no waste, with K=64 192 -> 192, fine; 130 rows -> 160 vs 192).
+    try: "tile [256,256,64] or [256,256,16]/[128,256,64] in configs.json; check register spills in the build summary."
+
+  - id: transposed_operand_load
+    name: Avoid the transpose load path for col-major operands
+    stage: memory_access
+    description: K-grouped kernel loads A (M, rows) and B (N, rows) as column-major views of row-major [rows, N]/[rows, M] data
+    rationale: |
+      With rows as the contraction, the operand is contiguous along M (A) / N (B), the MMA wants K = rows as the
+      fast axis of A and a VNNI layout for B. The automatic selector picks a transposing load for A (32-bit pairs)
+      and a regular/VNNI load for B. Explicit atoms (make_block_2d_copy_A(XE_LOAD_2D_TRANSPOSE<32,...>{}, mma, A) ...)
+      change the block shape per message; a different block shape changes the number of messages per tile and
+      registers per message. The stall profile of grad_weight (SBID 31%) is the symptom to compare before/after.
+    try: "explicit copy ops for A and B in gemm_tile for KGroupedKernel only; keep M-grouped untouched"
+    evidence: "notes 11.4 (next steps: a K-contiguous copy atom for the transposed activation)"
+
+  - id: reorder_elimination
+    name: Fewer register-to-register reorders
+    stage: memory_access
+    description: reorder(tArA, tCrA); reorder(tBrB, tCrB) every K tile
+    rationale: |
+      The copy fragment layout (tArA) can differ from the MMA fragment layout (tCrA); reorder() then shuffles
+      registers. If the layouts agree the reorder is a no-op. get_block_2d_copy_A/B derive the copy from the MMA, so
+      they usually agree for the M-grouped kinds; the K-grouped transposed A is the likely mismatch. XMX utilization
+      much lower than XVE active (rule `xmx_underfed`) points here.
+    try: "inspect type of tArA vs tCrA (static_assert on their layouts); pass the fragment directly if equal"
+
+  - id: grouped_k_tail
+    name: K-grouped short contraction
+    stage: algorithmic
+    description: grad_weight tiles with ~6 K iterations
+    rationale: |
+      Each (group, m_tile, n_tile) is one WG's tile with its own prologue, mainloop of ceil(rows/32) iterations and an
+      epilogue (256x256 bf16 store). With 16 groups x (M/256) x (N/256) tiles over 56 WGs, per-tile fixed costs are
+      a large fraction. Options inside the ABI: (a) smaller output tile with more tiles in flight (128x256 gives 112
+      WGs, 2 per Xe core), (b) software-pipeline across tiles: issue the next tile's prologue prefetches before the
+      current tile's epilogue store (the tile sequence of a WG is known from the cursor), (c) keep the persistent
+      loop but let tiles of the same group and M-tile with adjacent n_idx share the A tile in registers/L1.
+      Split-K across work-groups needs scratch (out of scope) unless the K-split partial sums are reduced inside one
+      work-group (sub-groups handle K halves, reduce through SLM or via a second tile config).
+    try: "see 'prologue_overlap' and tile configs; split-K only inside a work-group"
+    evidence: "notes 0 (open item 3), 11.4"
+
+  - id: prologue_overlap
+    name: Prefetch the next tile during the epilogue
+    stage: algorithmic
+    description: persistent loop restarts the pipeline for every tile
+    rationale: |
+      gemm_tile fills the prefetch pipeline from scratch for each tile. The persistent loop knows the next tile
+      (lin + nwg) only after locate(); resolving it earlier (before the epilogue) and issuing its first
+      `prefetch_dist` prefetches before reorder(tCrD, tCrD_final) / the store hides the prologue latency, which is
+      proportionally largest for short-K tiles.
+    try: "split gemm_tile into prologue()/mainloop()/epilogue(); call locate() for the next tile before the epilogue"
+
+  - id: tile_padding
+    name: Row padding of small groups
+    stage: algorithmic
+    description: ceil(rows/256) M-tiles per group; the last tile is mostly padding at ~190 rows
+    rationale: |
+      A group of 190 rows runs one 256-row tile at 74% fill; 128-row tiles would run 2 tiles at 74%/... Measured: a
+      static 128x256 tile loses ~10% at 190 rows, wins at <=128 (notes 17.2). Since config must not depend on host
+      row counts, an on-device decision per group (rows <= 128 -> half-height work) is the only legal adaptive route;
+      keep the same WG size and instantiate both code paths in one kernel (register pressure and code size: check
+      spills and instruction fetch stalls).
+    try: "device-side branch in the scheduler/gemm_tile; or leave to the tile config sweep"
+    evidence: "notes 16.2, 17.2"
+
+  - id: scheduler_cost
+    name: Scheduler overhead
+    stage: algorithmic
+    description: 64-bit modulo/division per tile, repeated offs loads
+    rationale: |
+      locate() uses int64 `%` and `/` by runtime tiles_m; with 6 K-iterations per tile this integer work is a
+      visible fraction. Using int32 math and a precomputed reciprocal, or incremental (m, n) stepping when
+      nwg divides cleanly, removes it. Verify with the XMX utilization vs XVE active gap.
+    try: "int32 index math; cache describe() results"
+
+  - id: raster_for_l3_reuse
+    name: Tile visiting order
+    stage: persistent_kernel
+    description: m-fastest within a group; WG w takes lin = w, w+nwg, ...
+    rationale: |
+      56 WGs working on consecutive linear indices touch 56 consecutive (m, n) tiles. m-fastest shares the B tile
+      (N slice, all K) among consecutive m tiles and re-reads A per n; for M-grouped calls with 1 m-tile per group
+      (190 rows) consecutive WGs walk n for the same A rows (A reused from L3/L1) but different B per group.
+      Alternatives: n-fastest, 2D swizzled groups of tiles, or group-major order. HBM and L3 are not saturated
+      (notes 11.3), so expect modest gains; the idle last wave is the larger effect.
+    try: "change the m_idx/n_idx decode in Scheduler::locate"
+    evidence: "notes 11.3, 11.4"
+
+  - id: grid_size
+    name: Persistent grid size (wgs)
+    stage: persistent_kernel
+    description: '"wgs": 0 means Xe cores x 512 / threads (56 for 256x256)'
+    rationale: |
+      One 512-thread work-group per Xe core is the maximum resident at grf 256. Fewer WGs leave cores idle; more
+      WGs than fit queue behind the resident ones and are only useful if the tail is shorter. For 128-row tiles
+      (256 threads) the rule yields 112. A non-multiple of the tile count for a given call leaves a partial last wave
+      (idle XVEs 28-33% for M-grouped, notes 11.2).
+    try: "wgs in configs.json per kind: 28/56/84/112; code: chunked tile assignment"
+
+  - id: tail_balancing
+    name: Last-wave balancing without scratch
+    stage: persistent_kernel
+    description: static round-robin assignment leaves some WGs idle at the end
+    rationale: |
+      Dynamic work stealing (atomic counter) needs a zero-initialized global counter: no scratch in the ABI. Static
+      alternatives: assign tiles in an order that puts the cheapest (smallest K / edge) tiles last, interleave n so
+      that the final wave has equal work, or split the last wave's tiles into half-height tiles (rows 128) so that
+      more WGs get work. For K-grouped tiles, work is proportional to ceil(rows/32), known from offs on the device.
+    try: "order tiles by descending K within the wave using the device-side offs"
+
+  - id: subgroup_layout
+    name: Sub-group layout over the WG tile
+    stage: device_specific
+    description: SGLayout 8x4 n-major for 256x256, 32x64 per sub-group
+    rationale: |
+      Layout<Shape<sgM,sgN,_1>,Stride<sgN,_1,_0>>: the per-SG tile (tileM/sgM) x (tileN/sgN) must be a multiple of
+      8x16. 32x64 gives 8 DPAS per A fragment and good reuse. Alternatives: 64x32 per SG (sg 4x8) changes which
+      operand is shared across sub-groups (the tuner knows c256x256_sg4x8, notes 0 item 4). Larger per-SG tiles raise
+      register pressure (spills!) and lower the number of sub-groups, smaller ones lower arithmetic intensity per load.
+    try: "configs.json sg and tile; check spills"
+
+  - id: grf128
+    name: GRF 128 vs 256
+    stage: device_specific
+    description: grf_size<256> in launch()
+    rationale: |
+      GRF 128 doubles resident threads per XVE and can help latency hiding, but spills with 32x64 fp32 accumulators
+      per sub-group. Only attempt together with a smaller per-SG tile (for example 16x64 / 32x32) so the accumulator
+      fits.
+    try: "intelex::grf_size<128> (launch properties) with tile/sg changes in configs.json"
+
+  - id: barrier_variants
+    name: Barrier placement
+    stage: device_specific
+    description: barrier_arrive(2) at the top and barrier_wait(2) at the bottom of every K iteration
+    rationale: |
+      Work-group-scope split barriers cost Sync/Dist stalls but keep sub-groups in step. Moving the wait later (after
+      the next copy is issued), arriving once per two K tiles, or sub-group scope (3) are variants. Without a
+      barrier sub-groups drift and L1 locality of the shared prefetch can degrade. The stall digest (Sync + Dist)
+      says if it is worth trying.
+    try: "barrier every 2 K tiles; scope variants"
+
+  - id: sweep_configs
+    name: Per-kind configuration sweeps
+    stage: autotuning
+    description: configs.json per kind
+    rationale: |
+      Kinds are independent kernels: sweep each kind alone and keep the best per kind (per-op evaluator ratios), then
+      confirm the combination. Valid space: tile M/N in {64,128,256,512} (WG threads <= 1024, per-SG tile multiple of
+      8x16), tile K in {16,32,64}, sg layouts dividing the tile, prefetch 1..5, wgs 0 or explicit. The tile must be a
+      single static choice per kind (rank_independent_choice) and robust across the quick suite's TP4/EP4 (~190 rows)
+      and EP8 (~6k rows) regimes, because the score is a geomean over both.
+    try: "ask for 6 variants per round; failures come back with the compile error"
+    evidence: "notes 16.2, 17.2, 0 (open items 3-5)"
+
+  - id: open_ended_hints
+    name: Ideas outside the stages above
+    stage: discovery
+    description: only with a concrete, implementable proposal
+    rationale: |
+      Examples that qualify: device-side per-group tile shape switch; K-grouped intra-WG split-K through SLM; cross-tile
+      software pipelining; a persistent loop that keeps the B fragment of the previous tile when n_idx repeats.
+      Examples that do not qualify: "use better tile sizes" (autotuning), "tune prefetch" (memory_access).
+    try: "describe before/after and why it is correct for ragged and empty groups"
