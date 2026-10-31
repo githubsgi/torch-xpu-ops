@@ -1,0 +1,5 @@
+#!/bin/bash
+# Wrapper so agents can call `ggemm-eval ...` from any directory.
+HERE=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+PY=${GGEMM_LOGIN_PYTHON:-$HOME/miniforge3/bin/python3}
+PYTHONPATH=$HERE${PYTHONPATH:+:$PYTHONPATH} exec "$PY" -m ggemm_agent.cli "$@"
