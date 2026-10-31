@@ -1,0 +1,5 @@
+#!/bin/bash
+# xpu-profile helper: xpu-report [args of make_report.py]
+here="$(cd "$(dirname "$0")/.." && pwd)"
+py="${GGEMM_PYTHON:-$HOME/miniforge3/bin/python3}"
+exec "$py" "$here/.claude/skills/xpu-profile/scripts/make_report.py" "$@"

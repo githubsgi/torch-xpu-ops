@@ -1,0 +1,11 @@
+# unitrace metric glossary (what `ggemm-eval profile` prints)
+- `XVE active / stall / idle %`: XVE_ACTIVE, XVE_STALL, remainder. Idle = no resident thread (tail, occupancy). Stall = resident but blocked.
+- `occupancy %`: XVE_THREADS_OCCUPANCY_ALL.
+- `XMX util %`: XVE_INST_EXECUTED_XMX_ALL_UTILIZATION - the DPAS pipe; the best single efficiency number.
+- `send util %`: SEND utilization (memory messages incl. 2D block loads/stores/prefetch).
+- `HBM rd/wr GB/s`: GPU_MEMORY_BYTE_READ/WRITE per kernel time. `L3 rd`: L3_BYTE_READ. Ceilings measured: HBM 1180, L3 2840 GB/s.
+- `MHz`: AvgGpuCoreFrequencyMHz (1.2-1.3 GHz typical under load).
+- `barrier msgs`: XVE_BARRIER_MESSAGE_COUNT.
+- Stall classes (percent of sampled instruction pointers; `Active` is the not-stalled class): Sbid (scoreboard: waiting on loads / sends), Pipe (pipeline busy), Dist (dependency distance), Sync (barrier/fence), InstrFetch (instruction cache), Other.
+- Kernel properties: SIMD, SLM, `Spill Memory Per Thread`, `Private Memory Per Thread`, GRF count.
+- grid `G x L`: global x local size -> work-groups = G / L (28672 x 512 = 56).

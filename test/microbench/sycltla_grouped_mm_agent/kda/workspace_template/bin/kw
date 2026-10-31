@@ -1,0 +1,13 @@
+#!/bin/bash
+# kernel-wiki front end: kw query|get|grep|validate ...
+here="$(cd "$(dirname "$0")/.." && pwd)"
+py="${GGEMM_PYTHON:-$HOME/miniforge3/bin/python3}"
+s="$here/.claude/skills/kernel-wiki/scripts"
+cmd="$1"; shift
+case "$cmd" in
+  query) exec "$py" "$s/query.py" "$@" ;;
+  get) exec "$py" "$s/get_page.py" "$@" ;;
+  grep) exec "$py" "$s/grep_wiki.py" "$@" ;;
+  validate) exec "$py" "$s/validate.py" "$@" ;;
+  *) echo "usage: kw query|get|grep|validate ..."; exit 2 ;;
+esac

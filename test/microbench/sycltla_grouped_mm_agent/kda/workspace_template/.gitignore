@@ -1,0 +1,4 @@
+cand/evals/
+cand/profiles/
+**/__pycache__/
+cand/last_eval.json

@@ -1,0 +1,5 @@
+#!/bin/bash
+# record benchmark rows / candidates:  kda-record bench|cand|show ...
+here="$(cd "$(dirname "$0")/.." && pwd)"
+py="${GGEMM_PYTHON:-$HOME/miniforge3/bin/python3}"
+exec "$py" "$here/tools/record.py" "$@"
