@@ -1,7 +1,7 @@
 """ggemm-eval: the one tool every harness (and every LLM agent) uses.
 
     ggemm-eval init <dir> [--from <cand>]       new candidate (production copy by default)
-    ggemm-eval run <dir> [--suite quick|small|large|full] [--ops a,b] [--verify-only]
+    ggemm-eval run <dir> [--suite quick|small|tp8ep8|large|full] [--ops a,b] [--verify-only]
     ggemm-eval profile <dir> [--case tp4ep4_uniform] [--op w13_dW]
     ggemm-eval diff <dir>                       candidate header vs production
     ggemm-eval slots                            who is using which node / tile
@@ -25,8 +25,9 @@ def main(argv=None):
     p.add_argument("--from", dest="src")
     p = sub.add_parser("run")
     p.add_argument("dir")
-    p.add_argument("--suite", default="quick", help="quick (2 cases) | small (TP4/EP4, ~190 rows/expert) | "
-                                                    "large (EP8, ~6k rows/expert) | full")
+    p.add_argument("--suite", default="quick", help="quick (2 cases) | small (TP4/EP4: 16 experts, ~190 rows each) | "
+                                                    "tp8ep8 (8 experts, ~190 rows each) | "
+                                                    "large (EP8: 8 experts, ~6k rows each) | full (all three)")
     p.add_argument("--ops", default="", help="subset, e.g. w13_dW,w2_dW (default all six)")
     p.add_argument("--verify-only", action="store_true")
     p.add_argument("--rounds", type=int, default=11)
