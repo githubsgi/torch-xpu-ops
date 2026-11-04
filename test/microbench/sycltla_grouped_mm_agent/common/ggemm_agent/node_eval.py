@@ -60,6 +60,38 @@ class Lock:
         shutil.rmtree(self.path, ignore_errors=True)
 
 
+def tile_numa(tile):
+    """NUMA node of the card that holds FLAT tile `tile` (cards in PCI order,
+    TILES_PER_NODE / cards tiles each; FLAT numbering follows the card order).
+    None if it cannot be read."""
+    cards = []
+    for c in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
+        dev = c / "device"
+        try:
+            if (dev / "vendor").read_text().strip() == "0x8086" and (dev / "numa_node").exists():
+                cards.append((os.path.realpath(dev), int((dev / "numa_node").read_text())))
+        except (OSError, ValueError):
+            continue
+    cards = sorted(set(cards))
+    if not cards:
+        return None
+    per_card = max(1, config.TILES_PER_NODE // len(cards))
+    i = tile // per_card
+    return cards[i][1] if i < len(cards) and cards[i][1] >= 0 else None
+
+
+def numa_prefix(numa):
+    """numactl prefix binding CPUs and memory to `numa` (empty if disabled)."""
+    if not config.NUMA_BIND or numa is None or not shutil.which("numactl"):
+        return []
+    return ["numactl", f"--cpunodebind={numa}", f"--membind={numa}"]
+
+
+def build_prefix():
+    """Builds run on the NUMA node of this harness's first tile."""
+    return numa_prefix(tile_numa(config.tiles()[0]))
+
+
 def error_digest(log, limit=60):
     """The compiler errors an agent needs, not the whole log."""
     lines = log.splitlines()
@@ -100,7 +132,8 @@ def build_unit(header_text, unit):
                + [str(config.EVAL_DIR / "cand_cfg.cpp"), "-o", str(so)])
         t0 = time.time()
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=config.BUILD_TIMEOUT_S)
+            p = subprocess.run(build_prefix() + cmd, capture_output=True, text=True,
+                               timeout=config.BUILD_TIMEOUT_S)
             log, rc = p.stdout + p.stderr, p.returncode
         except subprocess.TimeoutExpired as e:
             log, rc = f"build timed out after {config.BUILD_TIMEOUT_S} s\n{e.stdout or ''}{e.stderr or ''}", -1
@@ -139,7 +172,7 @@ def build_driver():
         common, device = icpx_common()
         cmd = (common + [f"-I{config.SRC_DIR}", f"-I{config.REPO_DIR}/src", f"-I{config.TUNER_DIR}"] + device
                + [str(srcs[0]), str(srcs[1]), "-ldl", "-rdynamic", "-o", str(exe) + ".tmp"])
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=config.BUILD_TIMEOUT_S)
+        p = subprocess.run(build_prefix() + cmd, capture_output=True, text=True, timeout=config.BUILD_TIMEOUT_S)
         (d / "build.log").write_text(" ".join(cmd) + "\n\n" + p.stdout + p.stderr)
         if p.returncode != 0:
             raise RuntimeError(f"agent_eval build failed, see {d / 'build.log'}:\n{error_digest(p.stdout + p.stderr)}")
@@ -185,6 +218,7 @@ def phase_build(job_dir):
 
 def run_driver(job_dir, tile, args, timeout):
     env = dict(os.environ, ZE_FLAT_DEVICE_HIERARCHY="FLAT", ZE_AFFINITY_MASK=str(tile))
+    args = numa_prefix(tile_numa(tile)) + list(args)
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env, cwd=job_dir)
         return p.returncode, p.stdout, p.stderr
@@ -210,6 +244,7 @@ def phase_run(job_dir, tile):
     rc, out, err = run_driver(job_dir, tile, args, job.get("timeout", config.RUN_TIMEOUT_S))
     (job_dir / "driver.log").write_text(out + "\n--- stderr ---\n" + err)
     res = {"rc": rc, "seconds": round(time.time() - t0, 1), "node": os.uname().nodename, "tile": tile,
+           "numa": tile_numa(tile) if config.NUMA_BIND else None,
            "stdout_tail": out[-4000:], "stderr_tail": err[-3000:]}
     try:
         res["driver"] = json.loads((job_dir / "driver.json").read_text())
