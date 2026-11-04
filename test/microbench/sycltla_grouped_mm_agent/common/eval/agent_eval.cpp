@@ -133,8 +133,11 @@ std::vector<int> route(const std::string& kind, int ep, int tokens, std::mt19937
   std::exit(2);
 }
 
-// Bench suites: (case name, ep, tokens/rank, routing). tp4ep4 = 16 local
-// experts x ~190 rows (torchtitan TP4 EP4); ep8 = 8 experts x ~6k rows.
+// Bench suites: (case name, ep, tokens/rank, routing). Tokens per rank follow
+// torchtitan's DSv3 16B runs (SEQ=2048, TOKENS=2048 per DP group, sequence
+// parallel over TP): tp4ep4 = 512 tokens/rank -> 16 local experts x ~190 rows;
+// tp8ep8 = 256 tokens/rank -> 8 local experts x ~190 rows; ep8 = the FSDP8
+// EP8 recipe, 8192 tokens/rank -> 8 experts x ~6k rows.
 struct BenchCase { std::string name; int ep, tokens; std::string routing; };
 
 std::vector<BenchCase> suite_cases(const std::string& s) {
@@ -142,20 +145,27 @@ std::vector<BenchCase> suite_cases(const std::string& s) {
       {"tp4ep4_uniform", 4, 512, "uniform"}, {"tp4ep4_balanced", 4, 512, "balanced"},
       {"tp4ep4_hot", 4, 512, "hot"},         {"tp4ep4_sparse", 4, 512, "sparse"},
       {"tp4ep4_rows64", 4, 512, "rows64"},   {"tp4ep4_rows8", 4, 512, "rows8"}};
+  std::vector<BenchCase> tp8 = {
+      {"tp8ep8_uniform", 8, 256, "uniform"}, {"tp8ep8_balanced", 8, 256, "balanced"},
+      {"tp8ep8_hot", 8, 256, "hot"},         {"tp8ep8_sparse", 8, 256, "sparse"},
+      {"tp8ep8_rows64", 8, 256, "rows64"}};
   std::vector<BenchCase> large = {
       {"ep8_uniform", 8, 8192, "uniform"}, {"ep8_balanced", 8, 8192, "balanced"},
       {"ep8_hot", 8, 8192, "hot"},         {"ep8_rows1024", 8, 8192, "rows1024"}};
+  std::vector<BenchCase> all = small;
+  all.insert(all.end(), tp8.begin(), tp8.end());
+  all.insert(all.end(), large.begin(), large.end());
   if (s == "quick") return {small[0], large[0]};
   if (s == "small") return small;
+  if (s == "tp8ep8") return tp8;
   if (s == "large") return large;
-  if (s == "full") { auto v = small; v.insert(v.end(), large.begin(), large.end()); return v; }
+  if (s == "full") return all;
   if (s == "none") return {};
   // a single case, e.g. --suite case:tp4ep4_hot
   if (s.rfind("case:", 0) == 0) {
-    auto v = small; v.insert(v.end(), large.begin(), large.end());
-    for (auto& c : v) if (c.name == s.substr(5)) return {c};
+    for (auto& c : all) if (c.name == s.substr(5)) return {c};
   }
-  std::fprintf(stderr, "unknown suite %s (quick|small|large|full|none|case:<name>)\n", s.c_str());
+  std::fprintf(stderr, "unknown suite %s (quick|small|tp8ep8|large|full|none|case:<name>)\n", s.c_str());
   std::exit(2);
 }
 
@@ -423,7 +433,7 @@ void usage() {
   std::printf(
       "agent_eval --base base.manifest --cand cand.manifest [options]\n"
       "  --mode verify|bench|both|profile   (default both)\n"
-      "  --suite quick|small|large|full|none|case:<name>   bench cases (default quick)\n"
+      "  --suite quick|small|tp8ep8|large|full|none|case:<name>   bench cases (default quick)\n"
       "  --ops a,b            subset of w13_fwd,w2_fwd,w13_dX,w2_dX,w13_dW,w2_dW\n"
       "  --verify-seed N      hidden verification seed (default 0)\n"
       "  --rounds N           A/B rounds per (case, op) (default 11)\n"
