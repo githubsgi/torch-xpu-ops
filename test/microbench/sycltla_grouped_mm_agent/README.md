@@ -74,8 +74,21 @@ notes 19.2).
 
 Settings (env): `GGEMM_AGENT_RUNS` (shared work dir, default
 `~/aimod/ggemm_agent_runs`), `GGEMM_NODES` / `GGEMM_NODEFILE` (default
-`~/PBS_NODEFILE`), `GGEMM_TILES_PER_NODE` (12), `GGEMM_SYCL_TLA_DIR`,
+`~/PBS_NODEFILE`), `GGEMM_TILES_PER_NODE` (12), `GGEMM_TILES` (tiles this
+process may use on every node, e.g. `0-1`; default all), `GGEMM_NUMA_BIND` (1:
+each evaluation runs under `numactl` on its tile's NUMA node, builds on the
+NUMA node of the first tile in `GGEMM_TILES`; 0: off), `GGEMM_SYCL_TLA_DIR`,
 `GGEMM_LLM_MODEL` (`opus`). See `common/ggemm_agent/config.py`.
+
+To give each harness its own tiles on one node (FLAT tiles 0-5 sit on NUMA
+node 0, 6-11 on NUMA node 1 on these PVC nodes):
+
+```bash
+export GGEMM_NODES=x1002c6s0b0n0.hostmgmt2002.cm.jf.intel.com
+GGEMM_TILES=0-1  python -m kda.rlcr ...            # NUMA 0
+GGEMM_TILES=2-5  python -m xe_forge.run ...        # NUMA 0
+GGEMM_TILES=6-11 python -m kernel_forge.mcts ...   # NUMA 1
+```
 
 Run the harnesses on the login node: it has the internet access `claude -p`
 needs, and it reaches the compute nodes over ssh. Compiles and GPU runs happen

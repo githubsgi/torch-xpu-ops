@@ -22,8 +22,8 @@ SLOT_ROOT = config.RUNS / "slots"
 
 
 def _slots(kind):
-    n = config.TILES_PER_NODE if kind == "gpu" else config.BUILDS_PER_NODE
-    return [(node, i) for node in config.nodes() for i in range(n)]
+    idx = config.tiles() if kind == "gpu" else range(config.BUILDS_PER_NODE)
+    return [(node, i) for node in config.nodes() for i in idx]
 
 
 def _path(kind, node, i):
