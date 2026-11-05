@@ -82,6 +82,21 @@ struct TileCfg256x256 {
   static constexpr int kPrefetchDist = 3;
 };
 
+// grad_weight (K-grouped) variant of the 256x256 tile: K step 16 and
+// prefetch distance 4. Each expert contributes only a short contraction
+// (~190 rows at TP4/EP4), so a finer K step with a deeper prefetch keeps
+// more loads in flight through the short mainloop. Same output tile and
+// sub-group layout as TileCfg256x256, so the tile id, the work-group size
+// and the default grid are unchanged.
+struct TileCfg256x256KGrouped {
+  using WGTile = Shape<_256, _256, _16>;
+  using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+  static constexpr int kTileM = 256;
+  static constexpr int kTileN = 256;
+  static constexpr int kTileK = 16;
+  static constexpr int kPrefetchDist = 4;
+};
+
 // 128x128x32 tile, 4x2 sub-groups (8 sub-groups = 128 threads), 32x64 per
 // sub-group. Small groups: less padding in a group's last row tile, and four
 // work-groups per Xe core.
@@ -138,13 +153,19 @@ template <
     class BTensor,
     class DTensor,
     class TiledMMA>
-CUTE_DEVICE void gemm_tile(
+CUTE_DEVICE int gemm_tile(
     ATensor const& A,
     BTensor const& B,
     DTensor& D,
     int m_idx,
     int n_idx,
-    TiledMMA const& mma) {
+    TiledMMA const& mma,
+    int pre_issued, // leading K tiles already prefetched by the previous tile
+    ATensor const& An, // operands of this work-group's next tile (prefetch)
+    BTensor const& Bn,
+    int mn_idx,
+    int nn_idx,
+    bool has_next) {
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   auto local_id = item.get_local_linear_id();
 
@@ -163,7 +184,24 @@ CUTE_DEVICE void gemm_tile(
 
   auto tiled_copy_a = get_block_2d_copy_A<void>(mma, A);
   auto tiled_copy_b = get_block_2d_copy_B<void>(mma, B);
-  auto tiled_copy_d = get_block_2d_copy_D<void>(mma, D);
+  // Epilogue store: the auto selector picks block width = one DPAS N atom
+  // (16 elements), i.e. 8x16 messages. A 2D store may be 64 bytes wide, so
+  // use 8 x (512 / bits) blocks when each sub-group's N slab allows it:
+  // half the store messages per tile (the reorder into the store fragment
+  // happens anyway for the fp32 -> bf16 conversion).
+  using DElem = typename DTensor::value_type;
+  constexpr int kDBits = int(sizeof_bits_v<DElem>);
+  constexpr int kStoreW = 512 / kDBits;
+  using MmaTileN = std::decay_t<decltype(get<1>(
+      std::declval<TiledMMA const&>().tile_mnk()))>;
+  using MmaThrN = std::decay_t<decltype(size<2>(
+      std::declval<TiledMMA const&>().get_thr_layout_vmnk()))>;
+  constexpr int kSgN = int(MmaTileN::value) / int(MmaThrN::value);
+  using StoreOp = std::conditional_t<
+      (kSgN % kStoreW == 0),
+      XE_STORE_2D<kDBits, 8, kStoreW>,
+      void>;
+  auto tiled_copy_d = get_block_2d_copy_D<StoreOp>(mma, D);
 
   auto thr_copy_a = tiled_copy_a.get_slice(local_id);
   auto thr_copy_b = tiled_copy_b.get_slice(local_id);
@@ -190,10 +228,30 @@ CUTE_DEVICE void gemm_tile(
   auto pAgA = thr_prefetch_A.partition_S(gA);
   auto pBgB = thr_prefetch_B.partition_S(gB);
 
+  // Prefetch view of the next tile: the prefetch pipeline continues across
+  // tile boundaries, so the next tile's first K tiles are requested during
+  // this tile's last mainloop iterations (not after its store).
+  Tensor cAn = make_identity_tensor(An.shape());
+  Tensor cBn = make_identity_tensor(Bn.shape());
+  Tensor gAn = local_tile(cAn, select<0, 2>(wg_tile), make_coord(mn_idx, _));
+  Tensor gBn = local_tile(cBn, select<1, 2>(wg_tile), make_coord(nn_idx, _));
+  auto prefetch_an =
+      make_block_2d_prefetch(get_block_2d_copy_A<void>(mma, An));
+  auto prefetch_bn =
+      make_block_2d_prefetch(get_block_2d_copy_B<void>(mma, Bn));
+  auto pAgAn = prefetch_an.get_slice(local_id).partition_S(gAn);
+  auto pBgBn = prefetch_bn.get_slice(local_id).partition_S(gBn);
+
   constexpr int barrier_scope = 2;
   constexpr int prefetch_dist = PrefetchDist;
   const int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
-  int prefetch_k = 0;
+  int next_limit = 0;
+  if (has_next) {
+    const int next_k_count = ceil_div(shape<1>(An), get<2>(wg_tile));
+    next_limit = next_k_count < prefetch_dist ? next_k_count : prefetch_dist;
+  }
+  int next_issued = 0;
+  int prefetch_k = pre_issued < k_tile_count ? pre_issued : k_tile_count;
 
   clear(tCrD);
 
@@ -215,6 +273,10 @@ CUTE_DEVICE void gemm_tile(
     if (prefetch_k < k_tile_count) {
       prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
       prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
+    } else if (next_issued < next_limit) {
+      prefetch(prefetch_an, pAgAn(_, _, _, next_issued));
+      prefetch(prefetch_bn, pBgBn(_, _, _, next_issued));
+      ++next_issued;
     }
 
     reorder(tArA, tCrA);
@@ -226,6 +288,7 @@ CUTE_DEVICE void gemm_tile(
 
   reorder(tCrD, tCrD_final);
   copy(tiled_copy_d, tCrD_final, tCgD);
+  return next_issued;
 }
 
 // Linearized, device-side tile scheduler over all groups. Every work-group
@@ -299,19 +362,103 @@ struct MGroupedKernel {
     T* b = const_cast<T*>(static_cast<const T*>(p.b));
     T* d = static_cast<T*>(p.d);
 
-    for (int64_t lin = wg;; lin += nwg) {
-      int32_t m_idx, n_idx;
-      if (!sched.locate(lin, cur, m_idx, n_idx)) {
-        break;
+    auto make_a = [&](const GroupCursor& c) {
+      return make_2d_tensor<'R'>(
+          a + int64_t(c.row_start) * p.lda, c.rows, p.K, int(p.lda));
+    };
+    auto make_b = [&](const GroupCursor& c) {
+      return make_2d_tensor<LayoutB>(
+          b + int64_t(c.g) * p.group_stride_b, p.N, p.K, int(p.ldb));
+    };
+
+    // Device-side wave-tail balancing (no scratch, only offs): count all
+    // tiles; if the last partial wave holds r tiles and S*r <= nwg, those r
+    // tiles are run as S*r narrower (TileN/S) sub-tiles, one per work-group,
+    // so the final wave takes ~1/S of a full tile instead of a full tile
+    // with most of the GPU idle. S = 4 when it fits, else 2.
+    int64_t total = 0;
+    for (int32_t g = 0; g < p.num_groups; ++g) {
+      GroupCursor c;
+      c.g = g;
+      sched.describe(c);
+      total += c.tiles;
+    }
+    const int64_t rem = total % nwg;
+    int split = 1;
+    if (rem > 0) {
+      if (kSplit4Ok && 4 * rem <= nwg) {
+        split = 4;
+      } else if (kSplit2Ok && 2 * rem <= nwg) {
+        split = 2;
       }
-      auto A = make_2d_tensor<'R'>(
-          a + int64_t(cur.row_start) * p.lda, cur.rows, p.K, int(p.lda));
-      auto B = make_2d_tensor<LayoutB>(
-          b + int64_t(cur.g) * p.group_stride_b, p.N, p.K, int(p.ldb));
+    }
+    const int64_t full_end = (split > 1) ? (total - rem) : total;
+
+    int32_t m_idx = 0, n_idx = 0;
+    bool valid = (int64_t(wg) < full_end) && sched.locate(wg, cur, m_idx, n_idx);
+    int pre_issued = 0;
+    for (int64_t lin = wg; valid; lin += nwg) {
+      GroupCursor nxt = cur;
+      int32_t mn_idx = 0, nn_idx = 0;
+      const bool has_next = (lin + nwg < full_end) &&
+          sched.locate(lin + nwg, nxt, mn_idx, nn_idx);
+      const GroupCursor& pc = has_next ? nxt : cur;
       auto D = make_2d_tensor<'R'>(
           d + int64_t(cur.row_start) * p.ldd, cur.rows, p.N, int(p.ldd));
-      gemm_tile<Cfg::kPrefetchDist>(A, B, D, m_idx, n_idx, mma);
+      pre_issued = gemm_tile<Cfg::kPrefetchDist>(
+          make_a(cur), make_b(cur), D, m_idx, n_idx, mma, pre_issued,
+          make_a(pc), make_b(pc), mn_idx, nn_idx, has_next);
+      cur = nxt;
+      m_idx = mn_idx;
+      n_idx = nn_idx;
+      valid = has_next;
     }
+
+    if (split > 1 && int64_t(wg) < int64_t(split) * rem) {
+      GroupCursor c;
+      sched.describe(c);
+      int32_t tm = 0, tn = 0;
+      const int64_t lin = full_end + int64_t(wg) / split;
+      const int q = int(int64_t(wg) % split);
+      if (sched.locate(lin, c, tm, tn)) {
+        auto A = make_a(c);
+        auto B = make_b(c);
+        auto D = make_2d_tensor<'R'>(
+            d + int64_t(c.row_start) * p.ldd, c.rows, p.N, int(p.ldd));
+        if constexpr (kSplit4Ok) {
+          if (split == 4) {
+            run_sub<4>(A, B, D, tm, tn * 4 + q);
+            return;
+          }
+        }
+        if constexpr (kSplit2Ok) {
+          run_sub<2>(A, B, D, tm, tn * 2 + q);
+        }
+      }
+    }
+  }
+
+  static constexpr int kThrN =
+      int(decltype(size<1>(typename Cfg::SGLayout{}))::value);
+  // A sub-tile needs >= one 16-wide DPAS N atom per sub-group.
+  static constexpr bool kSplit2Ok = (Cfg::kTileN % (2 * 16 * kThrN)) == 0;
+  static constexpr bool kSplit4Ok = (Cfg::kTileN % (4 * 16 * kThrN)) == 0;
+
+  template <int S>
+  using SubMma = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, float, T, T>>,
+      Layout<Shape<Int<Cfg::kTileM>, Int<Cfg::kTileN / S>, Int<Cfg::kTileK>>>,
+      typename Cfg::SGLayout>::TiledMMA;
+
+  template <int S, class AT, class BT, class DT>
+  CUTE_DEVICE void run_sub(
+      AT const& A, BT const& B, DT& D, int m_idx, int sub_n) const {
+    if (int64_t(sub_n) * (Cfg::kTileN / S) >= int64_t(p.N)) {
+      return; // sub-tile fully past N (ragged N): nothing to compute/store
+    }
+    const auto smma = SubMma<S>{};
+    gemm_tile<Cfg::kPrefetchDist>(
+        A, B, D, m_idx, sub_n, smma, 0, A, B, m_idx, sub_n, false);
   }
 };
 
@@ -334,21 +481,35 @@ struct KGroupedKernel {
     T* b = const_cast<T*>(static_cast<const T*>(p.b));
     T* d = static_cast<T*>(p.d);
 
-    for (int64_t lin = wg;; lin += nwg) {
-      int32_t m_idx, n_idx;
-      if (!sched.locate(lin, cur, m_idx, n_idx)) {
-        break;
-      }
-      // A: (M, rows) with element (m, r) at m + r * lda  -> column-major.
-      auto A = make_2d_tensor<'C'>(
-          a + int64_t(cur.row_start) * p.lda, p.M, cur.rows, int(p.lda));
-      // B as (N, rows) with element (n, r) at n + r * ldb -> column-major
-      // view of the row-major [rows, N] operand.
-      auto B = make_2d_tensor<'C'>(
-          b + int64_t(cur.row_start) * p.ldb, p.N, cur.rows, int(p.ldb));
+    // A: (M, rows) with element (m, r) at m + r * lda  -> column-major.
+    auto make_a = [&](const GroupCursor& c) {
+      return make_2d_tensor<'C'>(
+          a + int64_t(c.row_start) * p.lda, p.M, c.rows, int(p.lda));
+    };
+    // B as (N, rows) with element (n, r) at n + r * ldb -> column-major
+    // view of the row-major [rows, N] operand.
+    auto make_b = [&](const GroupCursor& c) {
+      return make_2d_tensor<'C'>(
+          b + int64_t(c.row_start) * p.ldb, p.N, c.rows, int(p.ldb));
+    };
+
+    int32_t m_idx = 0, n_idx = 0;
+    bool valid = sched.locate(wg, cur, m_idx, n_idx);
+    int pre_issued = 0;
+    for (int64_t lin = wg; valid; lin += nwg) {
+      GroupCursor nxt = cur;
+      int32_t mn_idx = 0, nn_idx = 0;
+      const bool has_next = sched.locate(lin + nwg, nxt, mn_idx, nn_idx);
+      const GroupCursor& pc = has_next ? nxt : cur;
       auto D = make_2d_tensor<'R'>(
           d + int64_t(cur.g) * p.group_stride_d, p.M, p.N, int(p.ldd));
-      gemm_tile<Cfg::kPrefetchDist>(A, B, D, m_idx, n_idx, mma);
+      pre_issued = gemm_tile<Cfg::kPrefetchDist>(
+          make_a(cur), make_b(cur), D, m_idx, n_idx, mma, pre_issued,
+          make_a(pc), make_b(pc), mn_idx, nn_idx, has_next);
+      cur = nxt;
+      m_idx = mn_idx;
+      n_idx = nn_idx;
+      valid = has_next;
     }
   }
 };
@@ -414,7 +575,7 @@ void run_k_grouped(sycl::queue& queue, const Params& p) {
       ? p.num_workgroups
       : default_num_workgroups(queue.get_device(), tile);
   if (tile == kTile256x256) {
-    run_k_grouped_cfg<TileCfg256x256, dt>(queue, p, num_wgs);
+    run_k_grouped_cfg<TileCfg256x256KGrouped, dt>(queue, p, num_wgs);
   } else if (tile == kTile128x128) {
     run_k_grouped_cfg<TileCfg128x128, dt>(queue, p, num_wgs);
   } else if (tile == kTile128x256) {
