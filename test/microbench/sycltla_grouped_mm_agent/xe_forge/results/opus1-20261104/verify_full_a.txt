@@ -1,0 +1,115 @@
+CANDIDATE: xf_t17_a
+STATUS: ok
+JOB: /home/subratag/aimod/ggemm_agent_runs/jobs/20261104-165228-3c1c1f-verify-xf-t17-a
+BUILD: ok in 0.0 s; register spills: none
+CORRECTNESS: PASS (22 hidden verification cases, full output vs fp32 reference, NaN sentinels around the output)
+CONFIG: m_rowB=256x256x32 sg8x4 pf3 wgs=56; m_colB=256x256x32 sg8x4 pf3 wgs=56; k_grouped=256x256x16 sg8x4 pf4 wgs=56
+SCORE: 1.1766x  (geomean over the routed cases of production/candidate time of the six GEMMs, suite full, on x1002c6s0b0n0.2; rowsN probe cases are not scored)
+case tp4ep4_uniform: six GEMMs base 1.6074 ms, cand 1.3458 ms -> 1.194x
+   w13_fwd  base 0.2912 ms (121 TF)  cand 0.2753 ms (128 TF)  1.062x  (noise: IQR of paired ratios 0.096)
+   w2_fwd   base 0.1658 ms (106 TF)  cand 0.1561 ms (113 TF)  1.083x  (noise: IQR of paired ratios 0.023)
+   w13_dX   base 0.3078 ms (115 TF)  cand 0.2778 ms (127 TF)  1.108x  (noise: IQR of paired ratios 0.010)
+   w2_dX    base 0.1551 ms (114 TF)  cand 0.1548 ms (114 TF)  1.006x  (noise: IQR of paired ratios 0.018)
+   w13_dW   base 0.4626 ms (76 TF)  cand 0.3203 ms (110 TF)  1.462x  (noise: IQR of paired ratios 0.063)
+   w2_dW    base 0.2248 ms (78 TF)  cand 0.1614 ms (109 TF)  1.392x  (noise: IQR of paired ratios 0.027)
+case tp4ep4_balanced: six GEMMs base 1.6176 ms, cand 1.3635 ms -> 1.186x
+   w13_fwd  base 0.3268 ms (108 TF)  cand 0.2998 ms (118 TF)  1.089x  (noise: IQR of paired ratios 0.026)
+   w2_fwd   base 0.1718 ms (103 TF)  cand 0.1538 ms (115 TF)  1.092x  (noise: IQR of paired ratios 0.027)
+   w13_dX   base 0.3084 ms (115 TF)  cand 0.2834 ms (125 TF)  1.092x  (noise: IQR of paired ratios 0.019)
+   w2_dX    base 0.1550 ms (114 TF)  cand 0.1546 ms (115 TF)  1.003x  (noise: IQR of paired ratios 0.012)
+   w13_dW   base 0.4343 ms (82 TF)  cand 0.3127 ms (113 TF)  1.392x  (noise: IQR of paired ratios 0.065)
+   w2_dW    base 0.2213 ms (80 TF)  cand 0.1592 ms (111 TF)  1.384x  (noise: IQR of paired ratios 0.018)
+case tp4ep4_hot: six GEMMs base 2.2198 ms, cand 1.9186 ms -> 1.157x
+   w13_fwd  base 0.4506 ms (115 TF)  cand 0.4391 ms (118 TF)  1.027x  (noise: IQR of paired ratios 0.016)
+   w2_fwd   base 0.2315 ms (112 TF)  cand 0.2209 ms (117 TF)  1.069x  (noise: IQR of paired ratios 0.027)
+   w13_dX   base 0.4375 ms (118 TF)  cand 0.4058 ms (128 TF)  1.077x  (noise: IQR of paired ratios 0.023)
+   w2_dX    base 0.2332 ms (111 TF)  cand 0.1984 ms (130 TF)  1.157x  (noise: IQR of paired ratios 0.029)
+   w13_dW   base 0.5802 ms (89 TF)  cand 0.4401 ms (118 TF)  1.308x  (noise: IQR of paired ratios 0.034)
+   w2_dW    base 0.2868 ms (90 TF)  cand 0.2143 ms (121 TF)  1.338x  (noise: IQR of paired ratios 0.023)
+case tp4ep4_sparse: six GEMMs base 1.0059 ms, cand 0.7251 ms -> 1.387x
+   w13_fwd  base 0.1593 ms (109 TF)  cand 0.1586 ms (109 TF)  1.002x  (noise: IQR of paired ratios 0.021)
+   w2_fwd   base 0.1049 ms (83 TF)  cand 0.0780 ms (111 TF)  1.286x  (noise: IQR of paired ratios 0.012)
+   w13_dX   base 0.1780 ms (98 TF)  cand 0.1380 ms (126 TF)  1.312x  (noise: IQR of paired ratios 0.026)
+   w2_dX    base 0.0793 ms (109 TF)  cand 0.0808 ms (107 TF)  0.982x  (noise: IQR of paired ratios 0.005)
+   w13_dW   base 0.3252 ms (53 TF)  cand 0.1737 ms (100 TF)  1.861x  (noise: IQR of paired ratios 0.051)
+   w2_dW    base 0.1592 ms (55 TF)  cand 0.0960 ms (90 TF)  1.649x  (noise: IQR of paired ratios 0.012)
+probe tp4ep4_rows64: six GEMMs base 1.1625 ms, cand 0.9617 ms -> 1.209x
+   w13_fwd  base 0.2542 ms (46 TF)  cand 0.2372 ms (50 TF)  1.080x  (noise: IQR of paired ratios 0.023)
+   w2_fwd   base 0.1339 ms (44 TF)  cand 0.1220 ms (48 TF)  1.089x  (noise: IQR of paired ratios 0.015)
+   w13_dX   base 0.2449 ms (48 TF)  cand 0.2330 ms (51 TF)  1.051x  (noise: IQR of paired ratios 0.031)
+   w2_dX    base 0.1205 ms (49 TF)  cand 0.1222 ms (48 TF)  0.989x  (noise: IQR of paired ratios 0.010)
+   w13_dW   base 0.2674 ms (44 TF)  cand 0.1633 ms (72 TF)  1.672x  (noise: IQR of paired ratios 0.082)
+   w2_dW    base 0.1417 ms (42 TF)  cand 0.0840 ms (70 TF)  1.691x  (noise: IQR of paired ratios 0.020)
+probe tp4ep4_rows8: six GEMMs base 0.9899 ms, cand 0.7766 ms -> 1.275x
+   w13_fwd  base 0.2282 ms (6 TF)  cand 0.2061 ms (7 TF)  1.096x  (noise: IQR of paired ratios 0.023)
+   w2_fwd   base 0.1206 ms (6 TF)  cand 0.1095 ms (7 TF)  1.081x  (noise: IQR of paired ratios 0.012)
+   w13_dX   base 0.2153 ms (7 TF)  cand 0.1844 ms (8 TF)  1.144x  (noise: IQR of paired ratios 0.017)
+   w2_dX    base 0.1185 ms (6 TF)  cand 0.1197 ms (6 TF)  0.993x  (noise: IQR of paired ratios 0.011)
+   w13_dW   base 0.2018 ms (7 TF)  cand 0.1017 ms (15 TF)  1.985x  (noise: IQR of paired ratios 0.028)
+   w2_dW    base 0.1055 ms (7 TF)  cand 0.0551 ms (13 TF)  1.911x  (noise: IQR of paired ratios 0.043)
+case tp8ep8_uniform: six GEMMs base 0.8503 ms, cand 0.6805 ms -> 1.249x
+   w13_fwd  base 0.1588 ms (111 TF)  cand 0.1563 ms (113 TF)  1.016x  (noise: IQR of paired ratios 0.011)
+   w2_fwd   base 0.1031 ms (86 TF)  cand 0.0759 ms (117 TF)  1.316x  (noise: IQR of paired ratios 0.022)
+   w13_dX   base 0.1776 ms (100 TF)  cand 0.1341 ms (132 TF)  1.339x  (noise: IQR of paired ratios 0.022)
+   w2_dX    base 0.0795 ms (111 TF)  cand 0.0786 ms (113 TF)  1.012x  (noise: IQR of paired ratios 0.022)
+   w13_dW   base 0.2158 ms (82 TF)  cand 0.1533 ms (115 TF)  1.426x  (noise: IQR of paired ratios 0.032)
+   w2_dW    base 0.1154 ms (77 TF)  cand 0.0822 ms (108 TF)  1.406x  (noise: IQR of paired ratios 0.011)
+case tp8ep8_balanced: six GEMMs base 0.8450 ms, cand 0.6748 ms -> 1.252x
+   w13_fwd  base 0.1593 ms (111 TF)  cand 0.1560 ms (114 TF)  1.014x  (noise: IQR of paired ratios 0.014)
+   w2_fwd   base 0.1026 ms (86 TF)  cand 0.0755 ms (117 TF)  1.317x  (noise: IQR of paired ratios 0.022)
+   w13_dX   base 0.1787 ms (99 TF)  cand 0.1351 ms (131 TF)  1.345x  (noise: IQR of paired ratios 0.026)
+   w2_dX    base 0.0792 ms (112 TF)  cand 0.0784 ms (113 TF)  1.004x  (noise: IQR of paired ratios 0.022)
+   w13_dW   base 0.2120 ms (84 TF)  cand 0.1487 ms (119 TF)  1.422x  (noise: IQR of paired ratios 0.028)
+   w2_dW    base 0.1132 ms (78 TF)  cand 0.0812 ms (109 TF)  1.392x  (noise: IQR of paired ratios 0.021)
+case tp8ep8_hot: six GEMMs base 1.4442 ms, cand 1.2329 ms -> 1.171x
+   w13_fwd  base 0.2771 ms (133 TF)  cand 0.2691 ms (137 TF)  1.028x  (noise: IQR of paired ratios 0.017)
+   w2_fwd   base 0.1738 ms (106 TF)  cand 0.1395 ms (132 TF)  1.222x  (noise: IQR of paired ratios 0.027)
+   w13_dX   base 0.3005 ms (122 TF)  cand 0.2477 ms (148 TF)  1.216x  (noise: IQR of paired ratios 0.012)
+   w2_dX    base 0.1545 ms (119 TF)  cand 0.1504 ms (122 TF)  1.027x  (noise: IQR of paired ratios 0.012)
+   w13_dW   base 0.3523 ms (104 TF)  cand 0.2814 ms (131 TF)  1.254x  (noise: IQR of paired ratios 0.025)
+   w2_dW    base 0.1860 ms (99 TF)  cand 0.1448 ms (127 TF)  1.280x  (noise: IQR of paired ratios 0.021)
+case tp8ep8_sparse: six GEMMs base 0.5184 ms, cand 0.4005 ms -> 1.294x
+   w13_fwd  base 0.0802 ms (109 TF)  cand 0.0800 ms (109 TF)  1.003x  (noise: IQR of paired ratios 0.012)
+   w2_fwd   base 0.0497 ms (88 TF)  cand 0.0490 ms (89 TF)  1.006x  (noise: IQR of paired ratios 0.019)
+   w13_dX   base 0.0860 ms (102 TF)  cand 0.0857 ms (102 TF)  0.999x  (noise: IQR of paired ratios 0.011)
+   w2_dX    base 0.0602 ms (73 TF)  cand 0.0356 ms (123 TF)  1.698x  (noise: IQR of paired ratios 0.033)
+   w13_dW   base 0.1603 ms (55 TF)  cand 0.0971 ms (90 TF)  1.644x  (noise: IQR of paired ratios 0.063)
+   w2_dW    base 0.0819 ms (53 TF)  cand 0.0531 ms (82 TF)  1.522x  (noise: IQR of paired ratios 0.022)
+probe tp8ep8_rows64: six GEMMs base 0.6236 ms, cand 0.4760 ms -> 1.310x
+   w13_fwd  base 0.1245 ms (47 TF)  cand 0.1251 ms (47 TF)  0.996x  (noise: IQR of paired ratios 0.014)
+   w2_fwd   base 0.0840 ms (35 TF)  cand 0.0611 ms (48 TF)  1.314x  (noise: IQR of paired ratios 0.017)
+   w13_dX   base 0.1450 ms (41 TF)  cand 0.1058 ms (56 TF)  1.357x  (noise: IQR of paired ratios 0.021)
+   w2_dX    base 0.0615 ms (48 TF)  cand 0.0624 ms (47 TF)  0.985x  (noise: IQR of paired ratios 0.009)
+   w13_dW   base 0.1357 ms (44 TF)  cand 0.0779 ms (76 TF)  1.699x  (noise: IQR of paired ratios 0.020)
+   w2_dW    base 0.0729 ms (40 TF)  cand 0.0437 ms (68 TF)  1.662x  (noise: IQR of paired ratios 0.050)
+case ep8_uniform: six GEMMs base 17.6108 ms, cand 17.0273 ms -> 1.034x
+   w13_fwd  base 3.9082 ms (145 TF)  cand 3.7662 ms (150 TF)  1.039x  (noise: IQR of paired ratios 0.016)
+   w2_fwd   base 2.0595 ms (137 TF)  cand 1.9521 ms (145 TF)  1.056x  (noise: IQR of paired ratios 0.009)
+   w13_dX   base 3.6257 ms (156 TF)  cand 3.5039 ms (161 TF)  1.036x  (noise: IQR of paired ratios 0.007)
+   w2_dX    base 1.9493 ms (145 TF)  cand 1.8777 ms (150 TF)  1.033x  (noise: IQR of paired ratios 0.015)
+   w13_dW   base 3.9751 ms (142 TF)  cand 3.8889 ms (145 TF)  1.027x  (noise: IQR of paired ratios 0.018)
+   w2_dW    base 2.0931 ms (135 TF)  cand 2.0385 ms (139 TF)  1.028x  (noise: IQR of paired ratios 0.024)
+case ep8_balanced: six GEMMs base 17.6168 ms, cand 17.0255 ms -> 1.035x
+   w13_fwd  base 3.8957 ms (146 TF)  cand 3.7497 ms (151 TF)  1.038x  (noise: IQR of paired ratios 0.012)
+   w2_fwd   base 2.0543 ms (138 TF)  cand 1.9583 ms (145 TF)  1.049x  (noise: IQR of paired ratios 0.007)
+   w13_dX   base 3.6242 ms (156 TF)  cand 3.5050 ms (162 TF)  1.034x  (noise: IQR of paired ratios 0.010)
+   w2_dX    base 1.9530 ms (145 TF)  cand 1.8784 ms (151 TF)  1.041x  (noise: IQR of paired ratios 0.012)
+   w13_dW   base 3.9868 ms (142 TF)  cand 3.8884 ms (146 TF)  1.024x  (noise: IQR of paired ratios 0.009)
+   w2_dW    base 2.1028 ms (135 TF)  cand 2.0459 ms (139 TF)  1.027x  (noise: IQR of paired ratios 0.030)
+case ep8_hot: six GEMMs base 38.6722 ms, cand 37.3023 ms -> 1.037x
+   w13_fwd  base 8.6428 ms (136 TF)  cand 8.3329 ms (141 TF)  1.037x  (noise: IQR of paired ratios 0.005)
+   w2_fwd   base 4.3548 ms (135 TF)  cand 4.1602 ms (141 TF)  1.046x  (noise: IQR of paired ratios 0.016)
+   w13_dX   base 8.0367 ms (146 TF)  cand 7.7517 ms (151 TF)  1.036x  (noise: IQR of paired ratios 0.003)
+   w2_dX    base 4.3134 ms (136 TF)  cand 4.1508 ms (141 TF)  1.041x  (noise: IQR of paired ratios 0.012)
+   w13_dW   base 8.7361 ms (134 TF)  cand 8.4910 ms (138 TF)  1.029x  (noise: IQR of paired ratios 0.008)
+   w2_dW    base 4.5885 ms (128 TF)  cand 4.4157 ms (133 TF)  1.041x  (noise: IQR of paired ratios 0.011)
+probe ep8_rows1024: six GEMMs base 3.0008 ms, cand 2.7944 ms -> 1.074x
+   w13_fwd  base 0.6429 ms (147 TF)  cand 0.6188 ms (153 TF)  1.053x  (noise: IQR of paired ratios 0.018)
+   w2_fwd   base 0.3388 ms (139 TF)  cand 0.3217 ms (147 TF)  1.045x  (noise: IQR of paired ratios 0.026)
+   w13_dX   base 0.6012 ms (157 TF)  cand 0.5850 ms (162 TF)  1.026x  (noise: IQR of paired ratios 0.017)
+   w2_dX    base 0.3350 ms (141 TF)  cand 0.3033 ms (156 TF)  1.103x  (noise: IQR of paired ratios 0.025)
+   w13_dW   base 0.7042 ms (134 TF)  cand 0.6441 ms (147 TF)  1.109x  (noise: IQR of paired ratios 0.022)
+   w2_dW    base 0.3787 ms (125 TF)  cand 0.3216 ms (147 TF)  1.186x  (noise: IQR of paired ratios 0.022)
+PER-OP: w13_fwd 1.038x, w2_fwd 1.133x, w13_dX 1.138x, w2_dX 1.061x, w13_dW 1.390x, w2_dW 1.371x
+VERDICT: IMPROVED
+DONE
