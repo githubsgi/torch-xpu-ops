@@ -54,10 +54,15 @@ using sycltla::grouped_gemm::Params;
 namespace {
 
 // ---------------------------------------------------------------- model ---
-constexpr int kDim = 2048;       // DeepSeek-V3 16B hidden size
-constexpr int kMoeHidden = 1408; // expert FFN width (w13 fuses 2 x 1408)
-constexpr int kExperts = 64;
-constexpr int kTopK = 6;
+// MoE models, from torchtitan's deepseek_v3/flavors.py: hidden size, routed
+// expert FFN width (w13 fuses w1 and w3, so it is 2 x moe_hidden wide),
+// routed experts, router top-k, and DeepSeek-V3's group-limited routing (each
+// token keeps the `limited` best of `groups` expert groups, then takes its
+// top-k inside them; groups = 1 is plain top-k). Expert weights are sharded
+// by EP only (no expert tensor parallelism), so TP does not change the shapes.
+struct Model { const char* name; int dim, moe_hidden, experts, topk, groups, limited; };
+constexpr Model kDsv3_16b{"dsv3_16b", 2048, 1408, 64, 6, 1, 1};
+constexpr Model kDsv3_671b{"dsv3_671b", 7168, 2048, 256, 8, 8, 4};
 constexpr int kGuard = 256;      // sentinel elements after every output
 constexpr uint16_t kSentinel = 0x7fc1; // a quiet NaN bit pattern
 
@@ -75,54 +80,75 @@ struct Problem {
   int n;
 };
 
-const std::vector<Problem>& dsv3_ops() {
-  static const std::vector<Problem> d = {
-      {"w13_fwd", kMRow, kDim, 2 * kMoeHidden},
-      {"w2_fwd", kMRow, kMoeHidden, kDim},
-      {"w13_dX", kMCol, 2 * kMoeHidden, kDim},
-      {"w2_dX", kMCol, kDim, kMoeHidden},
-      {"w13_dW", kK, 2 * kMoeHidden, kDim},
-      {"w2_dW", kK, kDim, kMoeHidden},
+// The six grouped GEMMs of one MoE layer (forward, grad_input, grad_weight of
+// w13 and w2), with the layouts autograd produces for torchtitan's GroupedLinear.
+std::vector<Problem> model_ops(const Model& m) {
+  const int d = m.dim, h = m.moe_hidden;
+  return {
+      {"w13_fwd", kMRow, d, 2 * h},
+      {"w2_fwd", kMRow, h, d},
+      {"w13_dX", kMCol, 2 * h, d},
+      {"w2_dX", kMCol, d, h},
+      {"w13_dW", kK, 2 * h, d},
+      {"w2_dW", kK, d, h},
   };
-  return d;
 }
 
 // -------------------------------------------------------------- routing ---
 // Per-local-expert row counts for EP rank 0 of a top-k router (as the tuner).
-std::vector<int> topk_counts(int g_tokens, int e_local, std::mt19937& rng,
+std::vector<int> topk_counts(const Model& m, int g_tokens, int e_local, std::mt19937& rng,
                              const std::vector<float>& bias, int force_expert) {
   std::uniform_real_distribution<float> u(0.f, 1.f);
-  std::vector<int> counts(kExperts, 0);
-  std::vector<std::pair<float, int>> s(kExperts);
+  const int E = m.experts, G = m.groups, per_group = m.experts / m.groups;
+  std::vector<int> counts(E, 0);
+  std::vector<std::pair<float, int>> s(E), gs(G);
   for (int t = 0; t < g_tokens; ++t) {
-    for (int e = 0; e < kExperts; ++e) {
-      float g = -std::log(-std::log(std::max(u(rng), 1e-12f)));
+    for (int e = 0; e < E; ++e) {
+      float g = -std::log(-std::log(std::max(u(rng), 1e-12f)));  // Gumbel noise
       s[e] = {bias.empty() ? u(rng) : bias[e] + g, e};
     }
     if (force_expert >= 0) s[force_expert].first = 1e9f;
-    std::partial_sort(s.begin(), s.begin() + kTopK, s.end(),
+    if (G > 1) {
+      // group score = sum of its two best experts; keep the `limited` best groups
+      for (int g = 0; g < G; ++g) {
+        float b1 = -1e30f, b2 = -1e30f;
+        for (int e = g * per_group; e < (g + 1) * per_group; ++e) {
+          const float v = s[e].first;
+          if (v > b1) { b2 = b1; b1 = v; } else if (v > b2) { b2 = v; }
+        }
+        gs[g] = {b1 + b2, g};
+      }
+      std::partial_sort(gs.begin(), gs.begin() + m.limited, gs.end(),
+                        [](auto& a, auto& b) { return a.first > b.first; });
+      std::vector<char> keep(G, 0);
+      for (int k = 0; k < m.limited; ++k) keep[gs[k].second] = 1;
+      for (int e = 0; e < E; ++e)
+        if (!keep[e / per_group]) s[e].first = -1e30f;
+    }
+    std::partial_sort(s.begin(), s.begin() + m.topk, s.end(),
                       [](auto& a, auto& b) { return a.first > b.first; });
-    for (int k = 0; k < kTopK; ++k) counts[s[k].second]++;
+    for (int k = 0; k < m.topk; ++k) counts[s[k].second]++;
   }
   return std::vector<int>(counts.begin(), counts.begin() + e_local);
 }
 
-std::vector<int> route(const std::string& kind, int ep, int tokens, std::mt19937& rng) {
+std::vector<int> route(const std::string& kind, const Model& m, int ep, int tokens, std::mt19937& rng) {
+  const int kExperts = m.experts, kTopK = m.topk;
   const int e_local = kExperts / ep, g_tokens = ep * tokens;
   if (kind.rfind("rows", 0) == 0) return std::vector<int>(e_local, std::stoi(kind.substr(4)));
   if (kind == "balanced") return std::vector<int>(e_local, g_tokens * kTopK / kExperts);
-  if (kind == "uniform") return topk_counts(g_tokens, e_local, rng, {}, -1);
+  if (kind == "uniform") return topk_counts(m, g_tokens, e_local, rng, {}, -1);
   if (kind == "skewed") {
     std::vector<int> rank(kExperts);
     std::iota(rank.begin(), rank.end(), 1);
     std::shuffle(rank.begin(), rank.end(), rng);
     std::vector<float> bias(kExperts);
     for (int e = 0; e < kExperts; ++e) bias[e] = -1.2f * std::log(float(rank[e]));
-    return topk_counts(g_tokens, e_local, rng, bias, -1);
+    return topk_counts(m, g_tokens, e_local, rng, bias, -1);
   }
-  if (kind == "hot") return topk_counts(g_tokens, e_local, rng, {}, 0);
+  if (kind == "hot") return topk_counts(m, g_tokens, e_local, rng, {}, 0);
   if (kind == "sparse") {
-    auto c = topk_counts(g_tokens, e_local, rng, {}, -1);
+    auto c = topk_counts(m, g_tokens, e_local, rng, {}, -1);
     std::vector<int> idx(e_local);
     std::iota(idx.begin(), idx.end(), 0);
     std::shuffle(idx.begin(), idx.end(), rng);
@@ -133,39 +159,55 @@ std::vector<int> route(const std::string& kind, int ep, int tokens, std::mt19937
   std::exit(2);
 }
 
-// Bench suites: (case name, ep, tokens/rank, routing). Tokens per rank follow
-// torchtitan's DSv3 16B runs (SEQ=2048, TOKENS=2048 per DP group, sequence
-// parallel over TP): tp4ep4 = 512 tokens/rank -> 16 local experts x ~190 rows;
-// tp8ep8 = 256 tokens/rank -> 8 local experts x ~190 rows; ep8 = the FSDP8
-// EP8 recipe, 8192 tokens/rank -> 8 experts x ~6k rows.
-struct BenchCase { std::string name; int ep, tokens; std::string routing; };
+// Bench suites: (case name, model, ep, tokens/rank, routing). Tokens per rank
+// follow torchtitan runs (sequence parallel over TP):
+//   DSv3 16B, SEQ=2048, TOKENS=2048 per DP group:
+//     tp4ep4 = 512 tokens/rank -> 16 local experts x ~190 rows
+//     tp8ep8 = 256 tokens/rank ->  8 local experts x ~190 rows
+//     ep8    = the FSDP8 EP8 recipe, 8192 tokens/rank -> 8 experts x ~6k rows
+//   DSv3 671B, seq_len 4096, local batch 1, TP8 EP32 (the N128 run of
+//   2026-09-17): 512 tokens/rank -> 8 local experts x ~512 rows, ~4k rows/rank
+struct BenchCase { std::string name; const Model* model; int ep, tokens; std::string routing; };
 
 std::vector<BenchCase> suite_cases(const std::string& s) {
+  const Model* m16 = &kDsv3_16b;
+  const Model* m671 = &kDsv3_671b;
   std::vector<BenchCase> small = {
-      {"tp4ep4_uniform", 4, 512, "uniform"}, {"tp4ep4_balanced", 4, 512, "balanced"},
-      {"tp4ep4_hot", 4, 512, "hot"},         {"tp4ep4_sparse", 4, 512, "sparse"},
-      {"tp4ep4_rows64", 4, 512, "rows64"},   {"tp4ep4_rows8", 4, 512, "rows8"}};
+      {"tp4ep4_uniform", m16, 4, 512, "uniform"}, {"tp4ep4_balanced", m16, 4, 512, "balanced"},
+      {"tp4ep4_hot", m16, 4, 512, "hot"},         {"tp4ep4_sparse", m16, 4, 512, "sparse"},
+      {"tp4ep4_rows64", m16, 4, 512, "rows64"},   {"tp4ep4_rows8", m16, 4, 512, "rows8"}};
   std::vector<BenchCase> tp8 = {
-      {"tp8ep8_uniform", 8, 256, "uniform"}, {"tp8ep8_balanced", 8, 256, "balanced"},
-      {"tp8ep8_hot", 8, 256, "hot"},         {"tp8ep8_sparse", 8, 256, "sparse"},
-      {"tp8ep8_rows64", 8, 256, "rows64"}};
+      {"tp8ep8_uniform", m16, 8, 256, "uniform"}, {"tp8ep8_balanced", m16, 8, 256, "balanced"},
+      {"tp8ep8_hot", m16, 8, 256, "hot"},         {"tp8ep8_sparse", m16, 8, 256, "sparse"},
+      {"tp8ep8_rows64", m16, 8, 256, "rows64"}};
   std::vector<BenchCase> large = {
-      {"ep8_uniform", 8, 8192, "uniform"}, {"ep8_balanced", 8, 8192, "balanced"},
-      {"ep8_hot", 8, 8192, "hot"},         {"ep8_rows1024", 8, 8192, "rows1024"}};
-  std::vector<BenchCase> all = small;
-  all.insert(all.end(), tp8.begin(), tp8.end());
-  all.insert(all.end(), large.begin(), large.end());
+      {"ep8_uniform", m16, 8, 8192, "uniform"}, {"ep8_balanced", m16, 8, 8192, "balanced"},
+      {"ep8_hot", m16, 8, 8192, "hot"},         {"ep8_rows1024", m16, 8, 8192, "rows1024"}};
+  std::vector<BenchCase> v671 = {
+      {"671b_tp8ep32_uniform", m671, 32, 512, "uniform"},
+      {"671b_tp8ep32_balanced", m671, 32, 512, "balanced"},
+      {"671b_tp8ep32_hot", m671, 32, 512, "hot"},
+      {"671b_tp8ep32_sparse", m671, 32, 512, "sparse"},
+      {"671b_tp8ep32_rows128", m671, 32, 512, "rows128"},
+      {"671b_tp8ep32_rows2048", m671, 32, 512, "rows2048"}};
+  std::vector<BenchCase> full = small;
+  full.insert(full.end(), tp8.begin(), tp8.end());
+  full.insert(full.end(), large.begin(), large.end());
+  std::vector<BenchCase> all = full;
+  all.insert(all.end(), v671.begin(), v671.end());
   if (s == "quick") return {small[0], large[0]};
   if (s == "small") return small;
   if (s == "tp8ep8") return tp8;
   if (s == "large") return large;
-  if (s == "full") return all;
+  if (s == "full") return full;
+  if (s == "671b") return v671;
+  if (s == "all") return all;
   if (s == "none") return {};
   // a single case, e.g. --suite case:tp4ep4_hot
   if (s.rfind("case:", 0) == 0) {
     for (auto& c : all) if (c.name == s.substr(5)) return {c};
   }
-  std::fprintf(stderr, "unknown suite %s (quick|small|tp8ep8|large|full|none|case:<name>)\n", s.c_str());
+  std::fprintf(stderr, "unknown suite %s (quick|small|tp8ep8|large|full|671b|all|none|case:<name>)\n", s.c_str());
   std::exit(2);
 }
 
@@ -361,20 +403,25 @@ std::vector<VerifyCase> verify_cases(uint32_t seed) {
   std::mt19937 rng(seed);
   std::vector<VerifyCase> v;
   // DSv3 shapes, small routed calls (hidden seed: different every evaluation).
-  auto routed = route("uniform", 4, 128 + int(rng() % 256), rng);  // 16 experts, ~50-140 rows
-  auto hot = route("hot", 8, 512 + int(rng() % 512), rng);         // 8 experts, one hot
+  const auto ops16 = model_ops(kDsv3_16b);
+  auto routed = route("uniform", kDsv3_16b, 4, 128 + int(rng() % 256), rng);  // 16 experts, ~50-140 rows
+  auto hot = route("hot", kDsv3_16b, 8, 512 + int(rng() % 512), rng);         // 8 experts, one hot
+  // 671B shapes (K / N up to 7168), small group-limited routed calls:
+  // 8 local experts x ~16-64 rows, so the naive reference stays cheap
+  auto routed671 = route("uniform", kDsv3_671b, 32, 16 + int(rng() % 48), rng);
   // Ragged: empty groups, single rows, sizes around the tile edges.
   const int edge_pool[] = {0, 1, 7, 15, 16, 31, 33, 127, 128, 129, 255, 257, 300, 0, 513};
   std::vector<int> edge(16);
   for (auto& e : edge) e = edge_pool[rng() % (sizeof(edge_pool) / sizeof(int))];
   edge[rng() % 16] = 0;
-  for (auto& op : dsv3_ops()) {
+  for (auto& op : model_ops(kDsv3_671b)) v.push_back({"671b_" + op.name + "/routed", op, routed671});
+  for (auto& op : ops16) {
     v.push_back({op.name + "/routed", op, routed});
     v.push_back({op.name + "/edge", op, edge});
   }
-  v.push_back({"w13_fwd/hot", dsv3_ops()[0], hot});
-  v.push_back({"w2_dX/hot", dsv3_ops()[3], hot});
-  v.push_back({"w2_dW/hot", dsv3_ops()[5], hot});
+  v.push_back({"w13_fwd/hot", ops16[0], hot});
+  v.push_back({"w2_dX/hot", ops16[3], hot});
+  v.push_back({"w2_dW/hot", ops16[5], hot});
   // Shapes that are not DSv3 (catch hard-coded dims). Leading dims stay
   // multiples of 32, which the production host checks require.
   std::vector<int> ragged5 = {37, 0, 96, 1, 210};
@@ -384,8 +431,8 @@ std::vector<VerifyCase> verify_cases(uint32_t seed) {
   v.push_back({"gen_k_m288_n64", {"gen", kK, 288, 64}, {0, 5, 64, 0, 33}});
   v.push_back({"gen_mrow_one_group", {"gen", kMRow, 512, 128}, {77}});
   // All groups empty: M-grouped writes nothing, K-grouped writes zeros.
-  v.push_back({"w2_fwd/all_empty", dsv3_ops()[1], std::vector<int>(8, 0)});
-  v.push_back({"w2_dW/all_empty", dsv3_ops()[5], std::vector<int>(8, 0)});
+  v.push_back({"w2_fwd/all_empty", ops16[1], std::vector<int>(8, 0)});
+  v.push_back({"w2_dW/all_empty", ops16[5], std::vector<int>(8, 0)});
   return v;
 }
 
@@ -433,7 +480,7 @@ void usage() {
   std::printf(
       "agent_eval --base base.manifest --cand cand.manifest [options]\n"
       "  --mode verify|bench|both|profile   (default both)\n"
-      "  --suite quick|small|tp8ep8|large|full|none|case:<name>   bench cases (default quick)\n"
+      "  --suite quick|small|tp8ep8|large|full|671b|all|none|case:<name>   bench cases (default quick)\n"
       "  --ops a,b            subset of w13_fwd,w2_fwd,w13_dX,w2_dX,w13_dW,w2_dW\n"
       "  --verify-seed N      hidden verification seed (default 0)\n"
       "  --rounds N           A/B rounds per (case, op) (default 11)\n"
@@ -507,15 +554,16 @@ int main(int argc, char** argv) {
 
   // ---- profile: candidate only, one (case, op), many launches
   if (o.mode == "profile") {
-    auto cases = suite_cases("full");
-    BenchCase bc{"", 0, 0, ""};
+    auto cases = suite_cases("all");
+    BenchCase bc{"", nullptr, 0, 0, ""};
     for (auto& c : cases) if (c.name == o.profile_case) bc = c;
     if (bc.name.empty()) { std::fprintf(stderr, "unknown --profile-case %s\n", o.profile_case.c_str()); return 2; }
     const Problem* pr = nullptr;
-    for (auto& p : dsv3_ops()) if (p.name == o.profile_op) pr = &p;
+    const auto ops = model_ops(*bc.model);
+    for (auto& p : ops) if (p.name == o.profile_op) pr = &p;
     if (!pr) { std::fprintf(stderr, "unknown --profile-op %s\n", o.profile_op.c_str()); return 2; }
     std::mt19937 rng(0);
-    Instance in(q, *pr, route(bc.routing, bc.ep, bc.tokens, rng), 1);
+    Instance in(q, *pr, route(bc.routing, *bc.model, bc.ep, bc.tokens, rng), 1);
     const auto& L = cand.launch[pr->kind];
     const int w = cand.wgs[pr->kind];
     Params p = in.params(in.d, w);
@@ -586,14 +634,14 @@ int main(int argc, char** argv) {
     bool first = true;
     for (auto& bc : suite_cases(o.suite)) {
       std::mt19937 rng(0);  // fixed routing: comparable across evaluations
-      auto counts = route(bc.routing, bc.ep, bc.tokens, rng);
+      auto counts = route(bc.routing, *bc.model, bc.ep, bc.tokens, rng);
       const int total = std::accumulate(counts.begin(), counts.end(), 0);
       std::printf("\n== bench %s: %zu experts, rows %d..%d, total %d\n", bc.name.c_str(), counts.size(),
                   *std::min_element(counts.begin(), counts.end()), *std::max_element(counts.begin(), counts.end()),
                   total);
       std::printf("  %-8s %9s %9s %8s %8s %8s  %s\n", "op", "base ms", "cand ms", "speedup", "base TF", "cand TF",
                   "full-output check vs baseline");
-      for (auto& pr : dsv3_ops()) {
+      for (auto& pr : model_ops(*bc.model)) {
         if (!op_selected(pr.name)) continue;
         Instance in(q, pr, counts, 1);
         const int kd = pr.kind;
