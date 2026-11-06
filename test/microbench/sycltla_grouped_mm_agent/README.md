@@ -63,7 +63,9 @@ treat less than 2% as noise.
 | `small` | TP4/EP4 (16 experts, ~190 rows each): uniform, balanced, hot, sparse, rows64, rows8 |
 | `tp8ep8` | TP8/EP8 (8 experts, ~190 rows each; 256 tokens/rank): uniform, balanced, hot, sparse, rows64 |
 | `large` | EP8 (8 experts, ~6k rows each): uniform, balanced, hot, rows1024 |
-| `full` | small + tp8ep8 + large |
+| `full` | small + tp8ep8 + large (DSv3 16B) |
+| `671b` | DSv3 671B TP8/EP32 (8 local experts, ~512 rows each; 512 tokens/rank = seq 4096 / TP8): uniform, balanced, hot, sparse, rows128, rows2048. dim 7168, expert width 2048 (w13 4096), 256 experts, top-8 with group-limited routing (4 of 8 groups) |
+| `all` | full + 671b |
 
 Contract of a candidate header (see `common/eval/cand_cfg.cpp`):
 `run_m_grouped_cfg<Cfg, DType, LayoutB>(queue, params, wgs)`,
