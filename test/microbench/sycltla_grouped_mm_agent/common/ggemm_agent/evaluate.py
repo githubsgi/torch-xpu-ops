@@ -26,7 +26,7 @@ from . import candidate, config, slots
 
 JOBS = config.RUNS / "jobs"
 LEDGER = config.RUNS / "ledger.jsonl"
-SUITES = ("quick", "small", "tp8ep8", "large", "full")
+SUITES = ("quick", "small", "tp8ep8", "large", "full", "671b", "all")
 
 
 def _job_dir(label):
