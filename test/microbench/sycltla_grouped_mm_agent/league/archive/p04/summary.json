@@ -1,0 +1,48 @@
+{
+ "period": 4,
+ "started": "2026-11-06 22:28:51",
+ "ended": "2026-11-07 00:00:55",
+ "incumbent": "p03_kernel_forge",
+ "incumbent_score_before": 1.1848854222622835,
+ "incumbent_remeasured": 1.182562598390969,
+ "verify": {
+  "incumbent": {
+   "runs": [
+    1.1878359364839117,
+    1.1772892602980265
+   ],
+   "mean": 1.182562598390969,
+   "min": 1.1772892602980265,
+   "ok": true
+  },
+  "kernel_forge": {
+   "runs": [
+    1.1984460789908518,
+    1.1683943199647424
+   ],
+   "mean": 1.183420199477797,
+   "min": 1.1683943199647424,
+   "ok": true
+  }
+ },
+ "notes": {
+  "incumbent": "p03_kernel_forge",
+  "xe_forge": "best == incumbent (no improvement kept)",
+  "kda": "best == incumbent (no improvement kept)",
+  "kernel_forge": "min 1.1684 not > 1.01 x incumbent 1.1826"
+ },
+ "spend": {
+  "xe_forge": 14.39,
+  "kda": 8.78,
+  "kernel_forge": 25.67
+ },
+ "spend_total": 192.64,
+ "harness_rc": {
+  "xe_forge": 0,
+  "kda": 0,
+  "kernel_forge": 0
+ },
+ "global": "p03_kernel_forge",
+ "global_score": 1.182562598390969,
+ "torch_compile": "-"
+}
