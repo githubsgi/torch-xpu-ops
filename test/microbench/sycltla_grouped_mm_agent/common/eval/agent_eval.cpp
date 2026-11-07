@@ -196,6 +196,8 @@ std::vector<BenchCase> suite_cases(const std::string& s) {
   std::vector<BenchCase> all = full;
   all.insert(all.end(), v671.begin(), v671.end());
   if (s == "quick") return {small[0], large[0]};
+  // one uniform case per regime: the harnesses' search suite
+  if (s == "search") return {small[0], tp8[0], large[0], v671[0]};
   if (s == "small") return small;
   if (s == "tp8ep8") return tp8;
   if (s == "large") return large;
@@ -207,7 +209,7 @@ std::vector<BenchCase> suite_cases(const std::string& s) {
   if (s.rfind("case:", 0) == 0) {
     for (auto& c : all) if (c.name == s.substr(5)) return {c};
   }
-  std::fprintf(stderr, "unknown suite %s (quick|small|tp8ep8|large|full|671b|all|none|case:<name>)\n", s.c_str());
+  std::fprintf(stderr, "unknown suite %s (quick|search|small|tp8ep8|large|full|671b|all|none|case:<name>)\n", s.c_str());
   std::exit(2);
 }
 
@@ -480,7 +482,7 @@ void usage() {
   std::printf(
       "agent_eval --base base.manifest --cand cand.manifest [options]\n"
       "  --mode verify|bench|both|profile   (default both)\n"
-      "  --suite quick|small|tp8ep8|large|full|671b|all|none|case:<name>   bench cases (default quick)\n"
+      "  --suite quick|search|small|tp8ep8|large|full|671b|all|none|case:<name>   bench cases (default quick)\n"
       "  --ops a,b            subset of w13_fwd,w2_fwd,w13_dX,w2_dX,w13_dW,w2_dW\n"
       "  --verify-seed N      hidden verification seed (default 0)\n"
       "  --rounds N           A/B rounds per (case, op) (default 11)\n"

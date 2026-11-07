@@ -25,7 +25,7 @@ def main(argv=None):
     p.add_argument("--from", dest="src")
     p = sub.add_parser("run")
     p.add_argument("dir")
-    p.add_argument("--suite", default="quick", help="quick (2 cases) | small (TP4/EP4: 16 experts, ~190 rows each) | "
+    p.add_argument("--suite", default="quick", help="quick (2 cases) | search (4 uniform cases: TP4/EP4, TP8/EP8, EP8, 671B) | small (TP4/EP4: 16 experts, ~190 rows each) | "
                                                     "tp8ep8 (8 experts, ~190 rows each) | "
                                                     "large (EP8: 8 experts, ~6k rows each) | full (all three, DSv3 16B) | "
                                                     "671b (DSv3 671B TP8/EP32: 8 experts, ~512 rows each) | all (full + 671b)")
