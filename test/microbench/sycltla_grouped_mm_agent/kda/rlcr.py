@@ -167,7 +167,7 @@ class Loop:
             shutil.copy(config.SRC_DIR / "grouped_mm_kernels.h", ws / "reference" / "grouped_mm_kernels.h")
             shutil.copy(config.EVAL_DIR / "cand_cfg.cpp", ws / "reference" / "cand_cfg.cpp")
             candidate.init_dir(ws / "production")
-            candidate.init_dir(ws / "cand")
+            candidate.init_dir(ws / "cand", self.a.start_from)
             candidate.init_dir(ws / "best", src=ws / "cand")
             seed = HERE / "bitlesson_seed.md"
             shutil.copy(seed, ws / ".humanize" / "bitlesson.md")
@@ -297,6 +297,9 @@ class Loop:
                          plan_file=str((self.loop_dir / "plan.md").relative_to(ws)), started_at=now(),
                          base_commit=self.commit("loop start"), max_stall=self.a.max_stall,
                          cost_cap_usd=self.a.max_llm_usd)
+        if getattr(self.a, "start_from", None):
+            # started from a seed kernel: it is the best to beat, not production
+            self.st.d.update(best_score=self.a.start_score or 1.0, best_id="seed")
         self.st.save()
         log("started loop %s" % self.loop_dir.name)
 
@@ -476,9 +479,9 @@ class Loop:
         ws, st = self.ws, self.st
         if self.fake:
             return "promotion skipped (fake)"
-        res = evaluate.evaluate(ws / "cand", suite="full", label="kda-r%d-full" % n)
+        res = evaluate.evaluate(ws / "cand", suite=self.a.promote_suite, label="kda-r%d-full" % n)
         (self.loop_dir / ("round-%d-full-eval.txt" % n)).write_text(res["text"] + "\n")
-        ok, why = promotion_check(res, st["best_score"])
+        ok, why = promotion_check(res, st["best_score"], self.a.promote_suite)
         if ok:
             for f in ("grouped_mm_kernel_impl.h", "configs.json"):
                 shutil.copy(ws / "cand" / f, ws / "best" / f)
@@ -564,9 +567,9 @@ class Loop:
         best = sha([ws / "best" / "grouped_mm_kernel_impl.h", ws / "best" / "configs.json"])
         final_txt = ""
         if cur != best and not self.fake:
-            res = evaluate.evaluate(ws / "cand", suite="full", label="kda-final")
+            res = evaluate.evaluate(ws / "cand", suite=self.a.promote_suite, label="kda-final")
             final_txt = res["text"]
-            ok, why = promotion_check(res, st["best_score"])
+            ok, why = promotion_check(res, st["best_score"], self.a.promote_suite)
             if ok:
                 for f in ("grouped_mm_kernel_impl.h", "configs.json"):
                     shutil.copy(ws / "cand" / f, ws / "best" / f)
@@ -705,12 +708,12 @@ def bitlesson_delta_error(summary, kb):
     return ""
 
 
-def promotion_check(res, best_score):
+def promotion_check(res, best_score, suite="full"):
     """Promotion criteria of CLAUDE.md on a FULL-suite result."""
     if res.get("status") != "ok":
         return False, "status %s" % res.get("status")
-    if res.get("suite") != "full":
-        return False, "not a full-suite result"
+    if res.get("suite") != suite:
+        return False, "not a %s-suite result" % suite
     if res.get("score", 0) < PROMOTE_SCORE:
         return False, "SCORE %.4f < %.2f" % (res["score"], PROMOTE_SCORE)
     bad = {k: v for k, v in (res.get("per_op") or {}).items() if v < PROMOTE_MIN_OP}
@@ -753,6 +756,10 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--workdir", required=True, help="run directory = the task workspace (resumable)")
     ap.add_argument("--phase", type=int, choices=(1, 2, 3), default=2)
+    ap.add_argument("--start-from", default=None,
+                    help="start cand/ and best/ from this candidate dir instead of production")
+    ap.add_argument("--start-score", type=float, default=None,
+                    help="full-suite SCORE of --start-from (vs production): the best score to beat")
     ap.add_argument("--max-rounds", type=int, default=42)
     ap.add_argument("--model", default=None, help="worker model (default $GGEMM_LLM_MODEL or opus)")
     ap.add_argument("--reviewer-model", default=None, help="default: same as --model")
@@ -761,6 +768,8 @@ def main(argv=None):
     ap.add_argument("--target-speedup", type=float, default=1.05)
     ap.add_argument("--guidance", default="", help="human guidance appended to the phase prompt")
     ap.add_argument("--guidance-file")
+    ap.add_argument("--promote-suite", default="full",
+                    help="suite of the promotion check and the final evaluation (e.g. all = 16B + 671B)")
     ap.add_argument("--eval-suite", default="quick", help="suite of the driver's per-round independent evaluation")
     ap.add_argument("--full-review-round", type=int, default=5, help="alignment audit at rounds N-1, 2N-1, ...")
     ap.add_argument("--max-stall", type=int, default=3, help="stop after this many consecutive STALLED/REGRESSED reviews")
