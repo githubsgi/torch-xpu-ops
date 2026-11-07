@@ -52,11 +52,12 @@ class Pipeline:
         # ---- baseline -------------------------------------------------
         base_dir = self.wd / "trials" / "base_cand"
         if not (base_dir / workspace.HEADER).exists():
-            candidate.init_dir(base_dir)
+            candidate.init_dir(base_dir, getattr(a, "start_from", None))
         self.tree = TrialTree(self.wd, baseline_digest=digest_dir(base_dir)[:16])
         self.lessons = Lessons(self.wd, a.lessons_dir, tag=self.state["run_id"])
         if "t0" not in self.tree.trials:
-            log(f"[baseline] evaluating production on suite {a.suite}")
+            log(f"[baseline] evaluating {'seed ' + a.start_from if getattr(a, 'start_from', None) else 'production'} "
+                f"on suite {a.suite}")
             res = evaluate.evaluate(base_dir, suite=a.suite, label="xf-baseline")
             if res["status"] != "ok":
                 log("baseline evaluation failed:\n" + res["text"])

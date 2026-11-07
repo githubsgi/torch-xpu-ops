@@ -13,6 +13,9 @@ def build_parser():
     ap.add_argument("--workdir", help="run directory (resumes if pipeline.json exists); default "
                                       "$GGEMM_AGENT_RUNS/xe_forge/<run-id>")
     ap.add_argument("--run-id", default=time.strftime("%Y%m%d-%H%M%S"))
+    ap.add_argument("--start-from", default=None,
+                    help="start from this candidate dir (header + configs.json) instead of production; "
+                         "scores stay relative to production")
     ap.add_argument("--stages", default="", help="comma list: algorithmic,discovery,memory_access,persistent_kernel,"
                                                   "device_specific,autotuning (default: stages with detected issues)")
     ap.add_argument("--model", default=os.environ.get("GGEMM_LLM_MODEL", "opus"))
