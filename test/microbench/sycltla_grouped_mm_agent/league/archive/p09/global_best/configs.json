@@ -1,0 +1,44 @@
+{
+  "extra_flags": [],
+  "m_rowB": {
+    "tile": [
+      256,
+      256,
+      32
+    ],
+    "sg": [
+      8,
+      4
+    ],
+    "prefetch": 3,
+    "wgs": 0,
+    "extra": "static constexpr int kBarrierEvery = 2; static constexpr bool kSkipIdleSg = true;"
+  },
+  "m_colB": {
+    "tile": [
+      256,
+      256,
+      32
+    ],
+    "sg": [
+      8,
+      4
+    ],
+    "prefetch": 3,
+    "wgs": 0,
+    "extra": "static constexpr int kBarrierEvery = 2; static constexpr bool kSkipIdleSg = true;"
+  },
+  "k_grouped": {
+    "tile": [
+      256,
+      256,
+      16
+    ],
+    "sg": [
+      8,
+      4
+    ],
+    "prefetch": 3,
+    "wgs": 0
+  }
+}
