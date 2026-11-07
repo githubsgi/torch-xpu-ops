@@ -1,0 +1,66 @@
+{
+ "period": 2,
+ "started": "2026-11-06 19:19:00",
+ "ended": "2026-11-06 21:09:07",
+ "incumbent": "v3_t17",
+ "incumbent_score_before": 1.1488284179506842,
+ "incumbent_remeasured": 1.1569663295592134,
+ "verify": {
+  "incumbent": {
+   "runs": [
+    1.1565437145334159,
+    1.1573889445850112
+   ],
+   "mean": 1.1569663295592134,
+   "min": 1.1565437145334159,
+   "ok": true
+  },
+  "xe_forge": {
+   "runs": [
+    1.1777874436250126,
+    1.1680591249908603
+   ],
+   "mean": 1.1729232843079365,
+   "min": 1.1680591249908603,
+   "ok": true
+  },
+  "kda": {
+   "runs": [
+    1.1674954758282141,
+    1.1655761487264584
+   ],
+   "mean": 1.1665358122773362,
+   "min": 1.1655761487264584,
+   "ok": true
+  },
+  "kernel_forge": {
+   "runs": [
+    1.1510572518128568,
+    1.153663833502967
+   ],
+   "mean": 1.1523605426579118,
+   "min": 1.1510572518128568,
+   "ok": true
+  }
+ },
+ "notes": {
+  "incumbent": "v3_t17",
+  "xe_forge": "min 1.1681 not > 1.01 x incumbent 1.1570",
+  "kda": "min 1.1656 not > 1.01 x incumbent 1.1570",
+  "kernel_forge": "min 1.1511 not > 1.01 x incumbent 1.1570"
+ },
+ "spend": {
+  "xe_forge": 10.91,
+  "kda": 16.95,
+  "kernel_forge": 25.0
+ },
+ "spend_total": 98.7,
+ "harness_rc": {
+  "xe_forge": 0,
+  "kda": 0,
+  "kernel_forge": 0
+ },
+ "global": "v3_t17",
+ "global_score": 1.1569663295592134,
+ "torch_compile": "-"
+}
