@@ -1,0 +1,48 @@
+{
+ "period": 1,
+ "started": "2026-11-06 17:50:50",
+ "ended": "2026-11-06 19:18:53",
+ "incumbent": "v3_t17",
+ "incumbent_score_before": 1.1518052321615548,
+ "incumbent_remeasured": 1.1488284179506842,
+ "verify": {
+  "incumbent": {
+   "runs": [
+    1.1467340271712227,
+    1.1509228087301455
+   ],
+   "mean": 1.1488284179506842,
+   "min": 1.1467340271712227,
+   "ok": true
+  },
+  "kernel_forge": {
+   "runs": [
+    1.1625784048574461,
+    1.15875562051897
+   ],
+   "mean": 1.160667012688208,
+   "min": 1.15875562051897,
+   "ok": true
+  }
+ },
+ "notes": {
+  "incumbent": "v3_t17",
+  "xe_forge": "best == incumbent (no improvement kept)",
+  "kda": "best == incumbent (no improvement kept)",
+  "kernel_forge": "min 1.1588 not > 1.01 x incumbent 1.1488"
+ },
+ "spend": {
+  "xe_forge": 8.14,
+  "kda": 12.51,
+  "kernel_forge": 25.19
+ },
+ "spend_total": 45.84,
+ "harness_rc": {
+  "xe_forge": 0,
+  "kda": 0,
+  "kernel_forge": 0
+ },
+ "global": "v3_t17",
+ "global_score": 1.1488284179506842,
+ "torch_compile": "-"
+}
