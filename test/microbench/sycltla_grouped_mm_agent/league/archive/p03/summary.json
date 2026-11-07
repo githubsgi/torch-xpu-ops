@@ -1,0 +1,48 @@
+{
+ "period": 3,
+ "started": "2026-11-06 21:09:10",
+ "ended": "2026-11-06 22:28:46",
+ "incumbent": "v3_t17",
+ "incumbent_score_before": 1.1569663295592134,
+ "incumbent_remeasured": 1.1494481629151685,
+ "verify": {
+  "incumbent": {
+   "runs": [
+    1.1490343695701024,
+    1.1498619562602348
+   ],
+   "mean": 1.1494481629151685,
+   "min": 1.1490343695701024,
+   "ok": true
+  },
+  "kernel_forge": {
+   "runs": [
+    1.1808605815025655,
+    1.1889102630220016
+   ],
+   "mean": 1.1848854222622835,
+   "min": 1.1808605815025655,
+   "ok": true
+  }
+ },
+ "notes": {
+  "incumbent": "v3_t17",
+  "xe_forge": "best == incumbent (no improvement kept)",
+  "kda": "best == incumbent (no improvement kept)",
+  "kernel_forge": "NEW GLOBAL BEST"
+ },
+ "spend": {
+  "xe_forge": 8.07,
+  "kda": 11.75,
+  "kernel_forge": 25.28
+ },
+ "spend_total": 143.8,
+ "harness_rc": {
+  "xe_forge": 0,
+  "kda": 0,
+  "kernel_forge": 0
+ },
+ "global": "p03_kernel_forge",
+ "global_score": 1.1848854222622835,
+ "torch_compile": "kernel_forge: ok (m_bf16 ok ; m_fp16 ok ; k_bf16 ok spilled around 3 spilled around 4 spilled around 5 ; k_fp16 ok spilled around 3 spilled around 4 spilled around 5)"
+}
