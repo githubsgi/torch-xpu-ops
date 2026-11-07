@@ -11,6 +11,7 @@ import os
 import random
 import shutil
 import socket
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -52,10 +53,18 @@ def _try(kind, node, i, label, stale_s):
 def acquire(kind, label="", prefer_node=None, stale_s=None, poll_s=2.0):
     """Block until a slot is free; yields (node, index)."""
     stale_s = stale_s or (config.RUN_TIMEOUT_S if kind == "gpu" else config.BUILD_TIMEOUT_S) + 600
-    slots = _slots(kind)
-    if not slots:
-        raise RuntimeError("no compute nodes: set GGEMM_NODES or GGEMM_NODEFILE")
     while True:
+        # re-read the node list every pass: the PBS job (and its node file)
+        # can change during a long run; with no nodes, wait for new ones
+        try:
+            slots = _slots(kind)
+        except (FileNotFoundError, OSError):
+            slots = []
+        if not slots:
+            print("[ggemm-eval] no compute nodes (GGEMM_NODES / GGEMM_NODEFILE); waiting",
+                  file=sys.stderr, flush=True)
+            time.sleep(60)
+            continue
         order = slots[:]
         random.shuffle(order)
         if prefer_node:

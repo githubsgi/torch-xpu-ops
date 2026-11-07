@@ -19,6 +19,7 @@ import os
 import random
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -26,7 +27,7 @@ from . import candidate, config, slots
 
 JOBS = config.RUNS / "jobs"
 LEDGER = config.RUNS / "ledger.jsonl"
-SUITES = ("quick", "small", "tp8ep8", "large", "full", "671b", "all")
+SUITES = ("quick", "search", "small", "tp8ep8", "large", "full", "671b", "all")
 
 
 def _job_dir(label):
@@ -73,7 +74,33 @@ def _geomean(xs):
     return math.exp(sum(math.log(x) for x in xs) / len(xs)) if xs else 0.0
 
 
+# ssh exit status for "could not connect / connection lost": the node, not the candidate
+SSH_FAILED = 255
+INFRA_RETRY_S = int(os.environ.get("GGEMM_INFRA_RETRY_S", str(6 * 3600)))
+
+
 def evaluate(cand_dir, suite="quick", mode="both", ops="", rounds=11, verify_seed=None, label="",
+             timeout=None):
+    """Evaluate a candidate; see the module docstring.
+
+    Infrastructure failures (ssh cannot reach a node, a node drops out of the
+    PBS job, the baseline itself fails to build) are not the candidate's
+    fault: they are retried with backoff for up to GGEMM_INFRA_RETRY_S
+    (default 6 h), re-reading the node list each time, instead of being
+    returned as a failed candidate."""
+    t0, attempt = time.time(), 0
+    while True:
+        res = _evaluate_once(cand_dir, suite, mode, ops, rounds, verify_seed, label, timeout)
+        if not res.get("infra") or time.time() - t0 > INFRA_RETRY_S:
+            return res
+        wait = min(60 * 2 ** attempt, 1800)
+        attempt += 1
+        print(f"[ggemm-eval] infrastructure failure ({res.get('error', '')[:200]!r}); "
+              f"retry {attempt} in {wait} s", file=sys.stderr, flush=True)
+        time.sleep(wait)
+
+
+def _evaluate_once(cand_dir, suite, mode, ops, rounds, verify_seed, label,
              timeout=None):
     t0 = time.time()
     cand_dir = Path(cand_dir)
@@ -104,7 +131,8 @@ def evaluate(cand_dir, suite="quick", mode="both", ops="", rounds=11, verify_see
             build_node = node
             rc, out, err = ssh_phase(node, job, "build", timeout=config.BUILD_TIMEOUT_S + 600)
         if not (job / "build.json").exists():
-            res.update(status="runtime_error", error=f"build phase failed on {node}: rc={rc}\n{err[-2000:]}")
+            res.update(status="runtime_error", error=f"build phase failed on {node}: rc={rc}\n{err[-2000:]}",
+                       infra=rc == SSH_FAILED)
             return _finish(res, t0)
     b = json.loads((job / "build.json").read_text())
     res["build"] = {"seconds": b["seconds"],
@@ -116,6 +144,7 @@ def evaluate(cand_dir, suite="quick", mode="both", ops="", rounds=11, verify_see
             errs.append(b["driver_error"])
         if any(not u["ok"] for u in b["base_units"]):
             errs.append("BASELINE build failed: environment problem, not the candidate")
+            res["infra"] = True
         res.update(status="build_error", error="\n".join(errs))
         return _finish(res, t0)
 
@@ -126,7 +155,8 @@ def evaluate(cand_dir, suite="quick", mode="both", ops="", rounds=11, verify_see
     try:
         run = json.loads((job / "run.json").read_text())
     except (FileNotFoundError, json.JSONDecodeError):
-        res.update(status="runtime_error", error=f"run phase failed on {node}.{tile}: rc={rc}\n{err[-2000:]}")
+        res.update(status="runtime_error", error=f"run phase failed on {node}.{tile}: rc={rc}\n{err[-2000:]}",
+                   infra=rc == SSH_FAILED)
         return _finish(res, t0)
     res["node"], res["tile"] = config.short(run["node"]), run["tile"]
     d = run.get("driver")

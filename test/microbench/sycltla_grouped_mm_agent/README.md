@@ -60,6 +60,7 @@ treat less than 2% as noise.
 | suite | cases |
 |---|---|
 | `quick` | `tp4ep4_uniform`, `ep8_uniform` |
+| `search` | one uniform case per regime: `tp4ep4_uniform`, `tp8ep8_uniform`, `ep8_uniform`, `671b_tp8ep32_uniform` |
 | `small` | TP4/EP4 (16 experts, ~190 rows each): uniform, balanced, hot, sparse, rows64, rows8 |
 | `tp8ep8` | TP8/EP8 (8 experts, ~190 rows each; 256 tokens/rank): uniform, balanced, hot, sparse, rows64 |
 | `large` | EP8 (8 experts, ~6k rows each): uniform, balanced, hot, rows1024 |
