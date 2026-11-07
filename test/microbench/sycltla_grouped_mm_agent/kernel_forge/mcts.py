@@ -74,16 +74,20 @@ class Forge:
         if t.root:
             return
         d = t.node_dir("n000")
-        candidate.init_dir(d)
+        seed = getattr(self.a, "start_from", None)
+        candidate.init_dir(d, seed)
         hdr, cfgs = candidate.load(d)
-        log(f"evaluating production root on '{self.a.suite}'")
+        log(f"evaluating {'seed ' + seed if seed else 'production'} root on '{self.a.suite}'")
         res = evaluate.evaluate(d, suite=self.a.suite, label="kf-root")
         evaluate.save_to_cand(res)
         if res["status"] != "ok":
             raise SystemExit(f"production root failed to evaluate: {res['text']}")
         # The root is the reference: L = 1 by definition; the measured self-score is the noise estimate.
-        n = Node(id="n000", parent=None, depth=0, visits=1, action="root", notes="production kernel",
-                 chash=content_hash(hdr, cfgs), score=1.0, eval=self.pack_eval(res))
+        # With --start-from the root is that kernel at its measured score (still vs production).
+        n = Node(id="n000", parent=None, depth=0, visits=1, action="root",
+                 notes=f"seed kernel {seed}" if seed else "production kernel",
+                 chash=content_hash(hdr, cfgs), score=res["score"] if seed else 1.0,
+                 eval=self.pack_eval(res))
         n.eval["measured_self_score"] = res["score"]
         t.add_node(n)
         t.save()
@@ -412,6 +416,9 @@ class Forge:
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--workdir", required=True)
+    ap.add_argument("--start-from", default=None,
+                    help="root = this candidate dir instead of production (score = its measured "
+                         "speedup vs production on --suite)")
     ap.add_argument("--iterations", type=int, default=50, help="total expansion attempts (resume: total target)")
     ap.add_argument("--workers", type=int, default=4, help="parallel expansions (<= 16 please)")
     ap.add_argument("--knob-ratio", type=float, default=0.3, help="fraction of expansions that are knob mutations")
