@@ -27,6 +27,7 @@
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/sycl.hpp>
+#include <type_traits>
 
 #include <cute/tensor.hpp>
 #include <cute/util/compat.hpp>
@@ -80,21 +81,25 @@ struct TileCfg256x256 {
   static constexpr int kTileN = 256;
   static constexpr int kTileK = 32;
   static constexpr int kPrefetchDist = 3;
+  // One split barrier every two K steps instead of every step, and
+  // sub-groups whose 32x64 accumulator block lies outside D skip the
+  // mainloop (see BarrierEveryOf / SkipIdleSgOf).
+  static constexpr int kBarrierEvery = 2;
+  static constexpr bool kSkipIdleSg = true;
 };
 
-// grad_weight (K-grouped) variant of the 256x256 tile: K step 16 and
-// prefetch distance 4. Each expert contributes only a short contraction
-// (~190 rows at TP4/EP4), so a finer K step with a deeper prefetch keeps
-// more loads in flight through the short mainloop. Same output tile and
-// sub-group layout as TileCfg256x256, so the tile id, the work-group size
-// and the default grid are unchanged.
+// grad_weight (K-grouped) variant of the 256x256 tile: K step 16. Each
+// expert contributes only a short contraction (~190 rows at TP4/EP4), so a
+// finer K step keeps more loads in flight through the short mainloop. Same
+// output tile and sub-group layout as TileCfg256x256, so the tile id, the
+// work-group size and the default grid are unchanged.
 struct TileCfg256x256KGrouped {
   using WGTile = Shape<_256, _256, _16>;
   using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
   static constexpr int kTileM = 256;
   static constexpr int kTileN = 256;
   static constexpr int kTileK = 16;
-  static constexpr int kPrefetchDist = 4;
+  static constexpr int kPrefetchDist = 3;
 };
 
 // 128x128x32 tile, 4x2 sub-groups (8 sub-groups = 128 threads), 32x64 per
@@ -119,6 +124,35 @@ struct TileCfg128x256 {
   static constexpr int kTileN = 256;
   static constexpr int kTileK = 32;
   static constexpr int kPrefetchDist = 3;
+};
+
+// Optional Cfg::kBarrierEvery: the work-group split barrier spans this many
+// K tiles (default 1 = arrive/wait every K tile). Larger values let the
+// sub-groups sharing an XVE drift apart by more than one K step, so one
+// sub-group's DPAS work can cover another's load latency on long K loops.
+template <class Cfg, class = void>
+struct BarrierEveryOf {
+  static constexpr int value = 1;
+};
+template <class Cfg>
+struct BarrierEveryOf<Cfg, std::void_t<decltype(Cfg::kBarrierEvery)>> {
+  static constexpr int value = Cfg::kBarrierEvery;
+};
+
+// Optional Cfg::kSkipIdleSg (default false): a sub-group whose whole
+// accumulator slab lies outside D (ragged last row tile of a group, or a
+// partial last N tile) skips its A/B block loads and DPAS work; it still
+// joins the work-group barriers and the cooperative prefetches. With ~190
+// rows per expert on 256-row tiles, 2 of 8 sub-group rows are idle, which
+// frees XMX issue slots and L1 load bandwidth for the busy sub-groups that
+// share their XVEs.
+template <class Cfg, class = void>
+struct SkipIdleSgOf {
+  static constexpr bool value = false;
+};
+template <class Cfg>
+struct SkipIdleSgOf<Cfg, std::void_t<decltype(Cfg::kSkipIdleSg)>> {
+  static constexpr bool value = bool(Cfg::kSkipIdleSg);
 };
 
 template <class T, class Cfg>
@@ -149,6 +183,8 @@ CUTE_DEVICE auto make_2d_tensor(T* ptr, int rows, int cols, int ld) {
 // what makes ragged group sizes work without padding.
 template <
     int PrefetchDist,
+    int BarrierEvery = 1,
+    bool SkipIdle = false,
     class ATensor,
     class BTensor,
     class DTensor,
@@ -255,6 +291,19 @@ CUTE_DEVICE int gemm_tile(
 
   clear(tCrD);
 
+  // Does this sub-group own any in-bounds output element? Only the slab's
+  // minimum corner matters: element 0 of each lane lies on the slab's first
+  // row, and lane 0 holds its first column. Uniform over the sub-group.
+  bool sg_active = true;
+  if constexpr (SkipIdle) {
+    Tensor tCcD = thr_mma.partition_C(gD);
+    auto c0 = tCcD(0);
+    const bool lane_active = (int(get<0>(c0)) < int(shape<0>(D))) &&
+        (int(get<1>(c0)) < int(shape<1>(D)));
+    sg_active = sycl::any_of_group(
+        sycl::ext::oneapi::this_work_item::get_sub_group(), lane_active);
+  }
+
   // Bounded by k_tile_count: with an empty contraction (K == 0, e.g. an
   // empty group in the K-grouped kernel) there is nothing to prefetch.
   CUTE_UNROLL
@@ -264,26 +313,58 @@ CUTE_DEVICE int gemm_tile(
     prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
   }
 
-  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, prefetch_k++) {
-    barrier_arrive(barrier_scope);
+  static_assert(BarrierEvery >= 1, "kBarrierEvery must be >= 1");
+  // Two copies of the mainloop: the busy one is exactly the unpredicated
+  // production loop (no runtime branch around the copy fragments, so no
+  // extra live ranges / spills); an idle sub-group runs only the barriers
+  // and the cooperative prefetches, keeping the barrier count identical.
+  auto mainloop = [&](auto active_tag) {
+    constexpr bool kActive = decltype(active_tag)::value;
+    for (int k_tile = 0; k_tile < k_tile_count; k_tile++, prefetch_k++) {
+      if constexpr (BarrierEvery == 1) {
+        barrier_arrive(barrier_scope);
+      } else if (k_tile % BarrierEvery == 0) {
+        barrier_arrive(barrier_scope);
+      }
 
-    copy(tiled_copy_a, tAgA(_, _, _, k_tile), tArA);
-    copy(tiled_copy_b, tBgB(_, _, _, k_tile), tBrB);
+      if constexpr (kActive) {
+        copy(tiled_copy_a, tAgA(_, _, _, k_tile), tArA);
+        copy(tiled_copy_b, tBgB(_, _, _, k_tile), tBrB);
+      }
 
-    if (prefetch_k < k_tile_count) {
-      prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
-      prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
-    } else if (next_issued < next_limit) {
-      prefetch(prefetch_an, pAgAn(_, _, _, next_issued));
-      prefetch(prefetch_bn, pBgBn(_, _, _, next_issued));
-      ++next_issued;
+      if (prefetch_k < k_tile_count) {
+        prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
+        prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
+      } else if (next_issued < next_limit) {
+        prefetch(prefetch_an, pAgAn(_, _, _, next_issued));
+        prefetch(prefetch_bn, pBgBn(_, _, _, next_issued));
+        ++next_issued;
+      }
+
+      if constexpr (kActive) {
+        reorder(tArA, tCrA);
+        reorder(tBrB, tCrB);
+
+        cute::gemm(mma, tCrA, tCrB, tCrD);
+      }
+      if constexpr (BarrierEvery == 1) {
+        barrier_wait(barrier_scope);
+      } else if (
+          (k_tile % BarrierEvery) == BarrierEvery - 1 ||
+          k_tile == k_tile_count - 1) {
+        barrier_wait(barrier_scope);
+      }
     }
-
-    reorder(tArA, tCrA);
-    reorder(tBrB, tCrB);
-
-    cute::gemm(mma, tCrA, tCrB, tCrD);
-    barrier_wait(barrier_scope);
+  };
+  if constexpr (SkipIdle) {
+    if (sg_active) {
+      mainloop(std::true_type{});
+    } else {
+      mainloop(std::false_type{});
+      return next_issued; // slab fully out of bounds: the store is a no-op
+    }
+  } else {
+    mainloop(std::true_type{});
   }
 
   reorder(tCrD, tCrD_final);
@@ -341,6 +422,77 @@ struct Scheduler {
     n_idx = int32_t(local / c.tiles_m);
     return true;
   }
+
+  // Sub-group-parallel variant of locate(): each lane reads the offs entries
+  // of one group (16 groups per round trip), an inclusive scan over the
+  // sub-group yields the cumulative tile counts, and the first lane whose
+  // cumulative end exceeds `linear` owns the tile. The serial walk issues
+  // one dependent offs load per group crossed (~10 L3 round trips before
+  // every tile on small-group cases); this needs one per 16 groups.
+  // Must be called in sub-group-uniform control flow with uniform `linear`.
+  // With linear < 0 it only counts: returns false and sets `total`.
+  CUTE_DEVICE bool locate_par(
+      int64_t linear,
+      GroupCursor& c,
+      int32_t& m_idx,
+      int32_t& n_idx,
+      int64_t* total = nullptr) const {
+    // Fast path: the next tile of a persistent work-group is often still in
+    // the group it already holds (large groups): no offs loads, no
+    // sub-group collectives. `c` is uniform across the sub-group.
+    if (linear >= 0 && c.tiles > 0 && linear >= c.tile_start &&
+        linear < c.tile_start + c.tiles) {
+      const int32_t local = int32_t(linear - c.tile_start);
+      m_idx = local % c.tiles_m;
+      n_idx = local / c.tiles_m;
+      return true;
+    }
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    const int lane = int(sg.get_local_linear_id());
+    const int nlanes = int(sg.get_local_linear_range());
+    const int32_t tiles_n = (n + TileN - 1) / TileN;
+    // Tile counts are scanned in 32-bit (native SIMD ops instead of
+    // emulated 64-bit adds/shuffles in the scan and broadcasts).
+    int32_t base = 0;
+    for (int32_t g0 = 0; g0 < num_groups; g0 += nlanes) {
+      const int32_t g = g0 + lane;
+      const bool in_range = g < num_groups;
+      int32_t start = 0, end = 0;
+      if (in_range) {
+        start = (g == 0) ? 0 : offs[g - 1];
+        end = offs[g];
+      }
+      start = start < 0 ? 0 : start;
+      const int32_t rows = (end > start) ? (end - start) : 0;
+      const int32_t m = KGrouped ? fixed_m : rows;
+      const int32_t tiles_m = (m + TileM - 1) / TileM;
+      const int32_t tiles = in_range ? tiles_m * tiles_n : 0;
+      const int32_t incl = base +
+          sycl::inclusive_scan_over_group(sg, tiles, sycl::plus<int32_t>());
+      const bool hit = in_range && (linear >= 0) && (int64_t(incl) > linear);
+      const int first = sycl::reduce_over_group(
+          sg, hit ? lane : nlanes, sycl::minimum<int>());
+      if (first < nlanes) {
+        c.g = g0 + first;
+        c.row_start = sycl::select_from_group(sg, start, first);
+        c.rows = sycl::select_from_group(sg, rows, first);
+        c.tiles_m = sycl::select_from_group(sg, tiles_m, first);
+        const int32_t t = sycl::select_from_group(sg, tiles, first);
+        const int32_t te = sycl::select_from_group(sg, incl, first);
+        c.tiles = int64_t(t);
+        c.tile_start = int64_t(te - t);
+        const int32_t local = int32_t(linear - c.tile_start);
+        m_idx = local % c.tiles_m;
+        n_idx = local / c.tiles_m;
+        return true;
+      }
+      base = sycl::select_from_group(sg, incl, nlanes - 1);
+    }
+    if (total != nullptr) {
+      *total = int64_t(base);
+    }
+    return false;
+  }
 };
 
 template <class T, char LayoutB, class Cfg>
@@ -352,7 +504,6 @@ struct MGroupedKernel {
     const Scheduler<false, Cfg::kTileM, Cfg::kTileN> sched{
         p.offs, p.num_groups, 0, p.N};
     GroupCursor cur;
-    sched.describe(cur);
 
     const int64_t wg = item.get_group_linear_id();
     const int64_t nwg = int64_t(item.get_group_range(0)) *
@@ -377,11 +528,10 @@ struct MGroupedKernel {
     // so the final wave takes ~1/S of a full tile instead of a full tile
     // with most of the GPU idle. S = 4 when it fits, else 2.
     int64_t total = 0;
-    for (int32_t g = 0; g < p.num_groups; ++g) {
+    {
       GroupCursor c;
-      c.g = g;
-      sched.describe(c);
-      total += c.tiles;
+      int32_t tm = 0, tn = 0;
+      sched.locate_par(-1, c, tm, tn, &total);
     }
     const int64_t rem = total % nwg;
     int split = 1;
@@ -395,17 +545,20 @@ struct MGroupedKernel {
     const int64_t full_end = (split > 1) ? (total - rem) : total;
 
     int32_t m_idx = 0, n_idx = 0;
-    bool valid = (int64_t(wg) < full_end) && sched.locate(wg, cur, m_idx, n_idx);
+    bool valid = (int64_t(wg) < full_end) && sched.locate_par(wg, cur, m_idx, n_idx);
     int pre_issued = 0;
     for (int64_t lin = wg; valid; lin += nwg) {
       GroupCursor nxt = cur;
       int32_t mn_idx = 0, nn_idx = 0;
       const bool has_next = (lin + nwg < full_end) &&
-          sched.locate(lin + nwg, nxt, mn_idx, nn_idx);
+          sched.locate_par(lin + nwg, nxt, mn_idx, nn_idx);
       const GroupCursor& pc = has_next ? nxt : cur;
       auto D = make_2d_tensor<'R'>(
           d + int64_t(cur.row_start) * p.ldd, cur.rows, p.N, int(p.ldd));
-      pre_issued = gemm_tile<Cfg::kPrefetchDist>(
+      pre_issued = gemm_tile<
+          Cfg::kPrefetchDist,
+          BarrierEveryOf<Cfg>::value,
+          SkipIdleSgOf<Cfg>::value>(
           make_a(cur), make_b(cur), D, m_idx, n_idx, mma, pre_issued,
           make_a(pc), make_b(pc), mn_idx, nn_idx, has_next);
       cur = nxt;
@@ -416,11 +569,10 @@ struct MGroupedKernel {
 
     if (split > 1 && int64_t(wg) < int64_t(split) * rem) {
       GroupCursor c;
-      sched.describe(c);
       int32_t tm = 0, tn = 0;
       const int64_t lin = full_end + int64_t(wg) / split;
       const int q = int(int64_t(wg) % split);
-      if (sched.locate(lin, c, tm, tn)) {
+      if (sched.locate_par(lin, c, tm, tn)) {
         auto A = make_a(c);
         auto B = make_b(c);
         auto D = make_2d_tensor<'R'>(
@@ -457,7 +609,10 @@ struct MGroupedKernel {
       return; // sub-tile fully past N (ragged N): nothing to compute/store
     }
     const auto smma = SubMma<S>{};
-    gemm_tile<Cfg::kPrefetchDist>(
+    gemm_tile<
+          Cfg::kPrefetchDist,
+          BarrierEveryOf<Cfg>::value,
+          SkipIdleSgOf<Cfg>::value>(
         A, B, D, m_idx, sub_n, smma, 0, A, B, m_idx, sub_n, false);
   }
 };
@@ -471,7 +626,6 @@ struct KGroupedKernel {
     const Scheduler<true, Cfg::kTileM, Cfg::kTileN> sched{
         p.offs, p.num_groups, p.M, p.N};
     GroupCursor cur;
-    sched.describe(cur);
 
     const int64_t wg = item.get_group_linear_id();
     const int64_t nwg = int64_t(item.get_group_range(0)) *
@@ -494,16 +648,19 @@ struct KGroupedKernel {
     };
 
     int32_t m_idx = 0, n_idx = 0;
-    bool valid = sched.locate(wg, cur, m_idx, n_idx);
+    bool valid = sched.locate_par(wg, cur, m_idx, n_idx);
     int pre_issued = 0;
     for (int64_t lin = wg; valid; lin += nwg) {
       GroupCursor nxt = cur;
       int32_t mn_idx = 0, nn_idx = 0;
-      const bool has_next = sched.locate(lin + nwg, nxt, mn_idx, nn_idx);
+      const bool has_next = sched.locate_par(lin + nwg, nxt, mn_idx, nn_idx);
       const GroupCursor& pc = has_next ? nxt : cur;
       auto D = make_2d_tensor<'R'>(
           d + int64_t(cur.g) * p.group_stride_d, p.M, p.N, int(p.ldd));
-      pre_issued = gemm_tile<Cfg::kPrefetchDist>(
+      pre_issued = gemm_tile<
+          Cfg::kPrefetchDist,
+          BarrierEveryOf<Cfg>::value,
+          SkipIdleSgOf<Cfg>::value>(
           make_a(cur), make_b(cur), D, m_idx, n_idx, mma, pre_issued,
           make_a(pc), make_b(pc), mn_idx, nn_idx, has_next);
       cur = nxt;
