@@ -14,7 +14,7 @@ TLA=${SYCL_TLA_DIR:?set SYCL_TLA_DIR to a sycl-tla checkout (v0.9)}
 AOT_DEVICE=${AOT_DEVICE:-pvc}
 OUT=${1:-$HERE/build}
 JOBS=${JOBS:-16}
-ALL=$(sed -n 's/^TUNE_CFG(\([a-z0-9_x]*\),.*/\1/p' "$HERE/tune_configs.h")
+ALL=$(sed -n 's/^TUNE_\(CFG\|PROD\)(\([a-z0-9_x]*\),.*/\2/p' "$HERE/tune_configs.h")
 CONFIGS=${CONFIGS:-$ALL}
 [ -d "$TLA/include/cute" ] || { echo "SYCL_TLA_DIR=$TLA does not look like a sycl-tla checkout"; exit 1; }
 command -v icpx >/dev/null || { echo "icpx not on PATH (load oneAPI first)"; exit 1; }

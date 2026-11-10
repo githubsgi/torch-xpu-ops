@@ -12,6 +12,11 @@
 // build.sh to tune it. Every config keeps the Cfg contract documented in
 // grouped_mm_kernel_impl.h (WGTile, SGLayout, kTileM/N/K, kPrefetchDist).
 // p256x128, p256x256, p128x128 and p128x256 are the four production configs.
+// p256x256 (the PVC default) is the production structs themselves (TUNE_PROD),
+// so the "vs production" column matches torch: its M-grouped kernels run
+// TileCfg256x256 (with kBarrierEvery / kSkipIdleSg) and its K-grouped kernel
+// runs TileCfg256x256KGrouped. A struct may set KGroupedCfg to give the
+// K-grouped kernel a different config (see tune_cfg.cpp).
 
 #pragma once
 
@@ -33,9 +38,16 @@ using namespace cute;
         #M "x" #N "x" #K " sg" #SGM "x" #SGN " pf" #PF;                       \
   };
 
+#define TUNE_PROD(NAME, BASE, KBASE, DESC)                                   \
+  struct NAME : sycltla::grouped_gemm::BASE {                                \
+    using KGroupedCfg = sycltla::grouped_gemm::KBASE;                        \
+    static constexpr const char* kDesc = DESC;                               \
+  };
+
 //        name          tileM tileN tileK sgM sgN prefetch
 TUNE_CFG(p256x128,      256,  128,  32,   8,  2,  3)   // production tile 1
-TUNE_CFG(p256x256,      256,  256,  32,   8,  4,  3)   // production tile 2 (PVC)
+TUNE_PROD(p256x256, TileCfg256x256, TileCfg256x256KGrouped,
+          "256x256x32 sg8x4 pf3 be2 skip, K: 256x256x16 pf3")  // production tile 2 (PVC)
 TUNE_CFG(c256x256_pf2,  256,  256,  32,   8,  4,  2)
 TUNE_CFG(c256x256_pf4,  256,  256,  32,   8,  4,  4)
 TUNE_CFG(c256x256_k64,  256,  256,  64,   8,  4,  2)
@@ -46,5 +58,6 @@ TUNE_CFG(c512x128,      512,  128,  32,  16,  2,  3)
 TUNE_CFG(c256x256_sg4x8, 256, 256,  32,   4,  8,  3)
 
 #undef TUNE_CFG
+#undef TUNE_PROD
 
 } // namespace tune

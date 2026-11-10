@@ -6,7 +6,7 @@
 #
 # http://www.apache.org/licenses/LICENSE-2.0
 
-"""Standalone torch._grouped_mm benchmark with DeepSeek-V3 16B MoE shapes.
+"""Standalone torch._grouped_mm benchmark with DeepSeek-V3 16B and 671B MoE shapes.
 
 Reproduces, per EP rank, the six grouped GEMMs one torchtitan MoE layer issues
 per training step (torchtitan GroupedLinear calls
@@ -22,6 +22,13 @@ per training step (torchtitan GroupedLinear calls
 
 The layouts are exactly what autograd produces (see --show-calls).
 
+--model 671b (or --preset tp8ep32) uses the DeepSeek-V3 671B shapes instead:
+dim 7168, expert width 2048 (w13 is [E, 4096, 7168]), 256 routed experts,
+top-8 with group-limited routing (the 4 best of 8 expert groups per token):
+  w13_fwd [M, 7168] x [E, 7168, 4096] -> [M, 4096]   w2_fwd [M, 2048] -> [M, 7168]
+  w13_dX  [M, 4096] -> [M, 7168]                     w2_dX  [M, 7168] -> [M, 2048]
+  w13_dW  -> [E, 4096, 7168]                         w2_dW  -> [E, 7168, 2048]
+
 Row counts. With expert parallelism every rank holds E_local = 64 / EP experts
 and receives tokens from all EP ranks via variable all_to_all splits:
   * per-expert rows m_e range from 0 to EP * T (T = tokens per rank per
@@ -36,6 +43,9 @@ Presets (--preset):
   tp4ep4   EP=4, 512 tokens per rank: the measured layout from a torchtitan run
            with PPN=8 TP=4 EP=4 SEQ=2048 TOKENS=2048 (16 local experts, ~190
            rows per expert). Also enables --profiled.
+  tp8ep32  DSv3 671B, EP=32, 512 tokens per rank: TP=8 EP=32 with seq_len 4096
+           and local batch 1 (8 local experts, ~512 rows per expert, ~4096 rows
+           per rank, the median measured in a 128-node torchtitan run).
 
 --profiled adds cases built from the grouped_mm calls recorded in that run's
 Kineto profile (steps 25-27, all 8 ranks; per-rank total M from 187 to 6361,
@@ -49,7 +59,8 @@ Modes:
   vary_split  new per-expert split every call, total M held fixed
   vary_total  new routing every call, so total M changes too (what training does)
 
-Run:  python grouped_mm.dsv3_16b.py [--preset recipe|tp4ep4] [--ep N] [--tokens T] [--profiled]
+Run:  python grouped_mm.dsv3_16b.py [--preset recipe|tp4ep4|tp8ep32] [--model 16b|671b]
+                                   [--ep N] [--tokens T] [--profiled]
                                    [--iters 20] [--check] [--print-dispatch] [--json out.json]
 
 --print-dispatch shows (1) the dispatcher's kernel table for aten::_grouped_mm
@@ -75,21 +86,57 @@ import time
 import torch
 import torch.nn.functional as F
 
-# DeepSeek-V3 16B (torchtitan/models/deepseek_v3/flavors.py::_16b)
+# DeepSeek-V3 models (torchtitan/models/deepseek_v3/flavors.py::_16b / _671b):
+# hidden size, routed expert width (w13 fuses w1 and w3, so it is 2 x
+# moe_hidden wide), routed experts, router top-k, and the group-limited routing
+# of DeepSeek-V3 (each token keeps the `limited` best of `groups` expert groups,
+# scored by the sum of their two best experts, then takes its top-k inside
+# them; one group is plain top-k). Expert weights are sharded by EP only (no
+# expert tensor parallelism), so TP does not change the shapes.
+MODELS = {
+    "16b": dict(dim=2048, moe_hidden=1408, experts=64, top_k=6, groups=1, limited=1),
+    "671b": dict(dim=7168, moe_hidden=2048, experts=256, top_k=8, groups=8, limited=4),
+}
+# The model in use; set_model() changes these (default: DSv3 16B).
 DIM = 2048
 MOE_HIDDEN = 1408
 NUM_EXPERTS = 64
 TOP_K = 6
+N_GROUPS = 1
+N_LIMITED = 1
 SEQ_LEN = 2048
 SEQS_PER_MICROBATCH = 4  # num_tokens_per_microbatch_per_dp_rank = 4 * seq_len
 
 OPS = ["w13_fwd", "w2_fwd", "w13_dX", "w2_dX", "w13_dW", "w2_dW"]
 
 PRESETS = {
-    "recipe": {"ep": 8, "tokens": SEQS_PER_MICROBATCH * SEQ_LEN},
+    "recipe": {"model": "16b", "ep": 8, "tokens": SEQS_PER_MICROBATCH * SEQ_LEN},
     # TOKENS=2048 per DP group, sequence parallel over TP=4 -> 512 tokens per rank
-    "tp4ep4": {"ep": 4, "tokens": 512},
+    "tp4ep4": {"model": "16b", "ep": 4, "tokens": 512},
+    # DSv3 671B, seq_len 4096, local batch 1, sequence parallel over TP=8 ->
+    # 512 tokens per rank; 256 / 32 = 8 local experts, ~512 rows each
+    "tp8ep32": {"model": "671b", "ep": 32, "tokens": 512},
 }
+
+# Default --sweep per model: equal rows per local expert. The 16B list goes up
+# to EP * T for the recipe; at 671B shapes the large points are slow and big.
+SWEEP_DEFAULT = {
+    "16b": "0,8,64,256,1024,2048,4096,6144,12288,24576,49152",
+    "671b": "0,8,64,256,512,1024,2048,4096",
+}
+
+
+def set_model(name):
+    global DIM, MOE_HIDDEN, NUM_EXPERTS, TOP_K, N_GROUPS, N_LIMITED
+    m = MODELS[name]
+    DIM, MOE_HIDDEN, NUM_EXPERTS, TOP_K = (
+        m["dim"],
+        m["moe_hidden"],
+        m["experts"],
+        m["top_k"],
+    )
+    N_GROUPS, N_LIMITED = m["groups"], m["limited"]
+
 
 # grouped_mm row counts measured with Kineto in torchtitan-githubsgi, DSv3 16B,
 # PPN=8 TP=4 EP=4 SEQ=2048 TOKENS=2048, steps 25-27, all 8 ranks (2026-10-23,
@@ -146,6 +193,12 @@ def parse_args():
         help="EP / tokens layout (see the module docstring)",
     )
     p.add_argument(
+        "--model",
+        choices=sorted(MODELS),
+        default=None,
+        help="DeepSeek-V3 model whose MoE shapes to use (default: from --preset)",
+    )
+    p.add_argument(
         "--profiled",
         action="store_true",
         help="add the cases measured in the torchtitan TP4/EP4 profile",
@@ -166,8 +219,9 @@ def parse_args():
     p.add_argument("--modes", default="static,vary_split,vary_total")
     p.add_argument(
         "--sweep",
-        default="0,8,64,256,1024,2048,4096,6144,12288,24576,49152",
-        help="equal rows per local expert for the M sweep ('' to skip)",
+        default=None,
+        help="equal rows per local expert for the M sweep ('' to skip; "
+        "default per model, see SWEEP_DEFAULT)",
     )
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--warmup", type=int, default=3)
@@ -196,6 +250,12 @@ def parse_args():
 
 
 def _topk_counts(logits_GE, e_local):
+    if N_GROUPS > 1:  # group-limited routing: keep the N_LIMITED best groups
+        g = logits_GE.view(logits_GE.shape[0], N_GROUPS, -1)
+        group_score = g.topk(2, dim=-1).values.sum(-1)  # [G, N_GROUPS]
+        keep = group_score.topk(N_LIMITED, dim=-1).indices
+        mask = torch.ones_like(group_score, dtype=torch.bool).scatter_(1, keep, False)
+        logits_GE = g.masked_fill(mask.unsqueeze(-1), float("-inf")).flatten(1)
     ids = logits_GE.topk(TOP_K, dim=-1).indices  # [G, TOP_K], distinct per token
     counts = torch.bincount(ids.flatten(), minlength=NUM_EXPERTS)
     return counts[:e_local].clone()
@@ -510,9 +570,17 @@ def main():
     a = parse_args()
     dev = a.device
     preset = PRESETS[a.preset]
+    a.model = a.model or preset["model"]
+    set_model(a.model)
     a.ep = a.ep if a.ep is not None else preset["ep"]
     a.tokens = a.tokens if a.tokens is not None else preset["tokens"]
+    a.sweep = a.sweep if a.sweep is not None else SWEEP_DEFAULT[a.model]
     profiled = a.profiled or a.preset == "tp4ep4"
+    if profiled and a.model != "16b":
+        print(
+            "== note: the profiled cases are DSv3 16B row counts; skipped for", a.model
+        )
+        profiled = False
     if profiled and a.ep != PROFILED_TP4EP4["ep"]:
         print(
             f"== note: profiled cases were measured with EP={PROFILED_TP4EP4['ep']}, "
@@ -538,6 +606,7 @@ def main():
 
     info = backend_info(dev)
     info.update(
+        model=a.model,
         preset=a.preset,
         profiled=profiled,
         ep=a.ep,

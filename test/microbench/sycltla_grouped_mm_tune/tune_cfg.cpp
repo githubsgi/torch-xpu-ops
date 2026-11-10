@@ -24,6 +24,17 @@ using namespace sycltla::grouped_gemm;
 using Cfg = tune::TUNE_CFG_NAME;
 using T = cute::bfloat16_t;
 
+// Config of the K-grouped kernel: Cfg::KGroupedCfg if the config defines one
+// (production 256x256: TileCfg256x256KGrouped), else Cfg itself.
+template <class C, class = void>
+struct KCfgOf {
+  using type = C;
+};
+template <class C>
+struct KCfgOf<C, std::void_t<typename C::KGroupedCfg>> {
+  using type = typename C::KGroupedCfg;
+};
+
 const tune::Candidate kCandidate{
     TUNE_STR(TUNE_CFG_NAME),
     Cfg::kDesc,
@@ -35,7 +46,7 @@ const tune::Candidate kCandidate{
       run_m_grouped_cfg<Cfg, DType::BF16, 'C'>(q, p, w);
     },
     [](sycl::queue& q, const Params& p, int w) {
-      run_k_grouped_cfg<Cfg, DType::BF16>(q, p, w);
+      run_k_grouped_cfg<typename KCfgOf<Cfg>::type, DType::BF16>(q, p, w);
     },
 };
 } // namespace
