@@ -1,0 +1,6 @@
+{
+  "extra_flags": [],
+  "m_rowB": {"tile": [256, 256, 32], "sg": [8, 4], "prefetch": 3, "wgs": 0, "barrier_every": 2, "skip_idle": true},
+  "m_colB": {"tile": [256, 256, 32], "sg": [8, 4], "prefetch": 3, "wgs": 0, "barrier_every": 2, "skip_idle": true},
+  "k_grouped": {"tile": [256, 256, 16], "sg": [8, 4], "prefetch": 3, "wgs": 0}
+}

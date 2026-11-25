@@ -85,3 +85,22 @@ Other options: `--suite quick|small` (search suite), `--final-suite full`, `--to
 At the end the production root and the top-k nodes are re-evaluated on the `full` suite; the best node
 is the one with the highest full score. Search-suite scores (2 cases) have a noise of a few percent, so
 treat a node as an improvement only if the full-suite score beats the re-run production by more than 2%.
+
+## v4 baseline and the section-14 knobs (2026-11-25)
+
+The scoring reference (`config.PROD_HEADER`, `candidate.production_configs()`) is now the v4 kernel of
+torch-xpu-ops PR 2358f4c1 (the output of the November league), with per-kind production configs: the
+M-grouped kinds carry `barrier_every 2` and `skip_idle`, grad_weight uses the K-step-16 config. Scores are
+therefore "vs v4"; the earlier runs scored vs v2.
+
+New optional per-kind keys in `configs.json` (see `candidate.KNOB_MEMBERS`): `barrier_every`, `skip_idle`,
+`cache_a`, `cache_b`, `cache_pf`, `grf`. The knob operator (`knobs.py`) mutates all of them. The production
+header reads only the first two; `seeds/v4_knobs/grouped_mm_kernel_impl.h` is the v4 header extended with
+LSC cache-hint copy atoms (`XE_LOAD_2D_CC`, `XE_PREFETCH_2D_CC`, wrapping the auto-selected sycl-tla atoms)
+and a `kGrf` switch in `launch()`. Start a run from it:
+
+```
+GGEMM_NODES=<idle nodes> ~/miniforge3/bin/python3 -u -m kernel_forge.mcts \
+    --workdir $GGEMM_AGENT_RUNS/kernel_forge/v4knobs --start-from kernel_forge/seeds/v4_knobs \
+    --iterations 120 --workers 8 --knob-ratio 0.5 --suite search --final-suite all --model opus
+```

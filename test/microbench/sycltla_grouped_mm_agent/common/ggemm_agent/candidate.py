@@ -16,6 +16,18 @@ Per kind, optional: "extra" (C++ member lines appended to the generated Cfg
 struct, e.g. "static constexpr int kSplitK = 2;") or "body" (the whole struct
 body, replacing the generated WGTile / SGLayout / k* members). "wgs" 0 means
 the production rule (Xe cores x 512 / work-group threads).
+
+Optional per-kind knobs that become Cfg members (emitted only when present):
+    "barrier_every": 2      kBarrierEvery  split barrier spans N K tiles (>= 1)
+    "skip_idle": true       kSkipIdleSg    idle sub-groups skip loads and DPAS
+    "cache_a": 2            kCacheA        LSC cache hint of the A loads
+    "cache_b": 0            kCacheB        ... of the B loads
+                            0 default (no modifier), 1 .ca.ca, 2 .st.ca (L1 streaming),
+                            3 .uc.ca (L1 uncached), 4 .uc.uc
+    "cache_pf": 1           kCachePf       prefetch hint: 0 .ca.ca (L1+L3), 1 .uc.ca (L3 only)
+    "grf": 128              kGrf           register file of the launch, 128 or 256
+The production header (v4, PR 2358f4c1) reads kBarrierEvery / kSkipIdleSg;
+the extended seed header (kernel_forge/seeds/v4_knobs) reads all of them.
 """
 
 import hashlib
@@ -28,14 +40,33 @@ from . import config
 KINDS = ("m_rowB", "m_colB", "k_grouped")
 KIND_MACRO = {"m_rowB": "CAND_MROW", "m_colB": "CAND_MCOL", "k_grouped": "CAND_K"}
 # Bump when the build recipe changes so cached .so files are not reused.
-BUILD_RECIPE = "v1"
+BUILD_RECIPE = "v2"
 
+# Production = v4 (PR 2358f4c1): 256x256x32 sg8x4 pf3 with kBarrierEvery 2 and
+# kSkipIdleSg on the M-grouped kinds; grad_weight uses TileCfg256x256KGrouped
+# (K step 16, barrier every K tile, no idle skip). Default grid everywhere.
 PRODUCTION_CFG = {"tile": [256, 256, 32], "sg": [8, 4], "prefetch": 3, "wgs": 0}
+PRODUCTION_CFGS = {
+    "m_rowB": {"tile": [256, 256, 32], "sg": [8, 4], "prefetch": 3, "wgs": 0, "barrier_every": 2, "skip_idle": True},
+    "m_colB": {"tile": [256, 256, 32], "sg": [8, 4], "prefetch": 3, "wgs": 0, "barrier_every": 2, "skip_idle": True},
+    "k_grouped": {"tile": [256, 256, 16], "sg": [8, 4], "prefetch": 3, "wgs": 0},
+}
+
+# knob key -> (C++ type, Cfg member, allowed values or None)
+KNOB_MEMBERS = {
+    "barrier_every": ("int", "kBarrierEvery", None),
+    "skip_idle": ("bool", "kSkipIdleSg", (False, True)),
+    "cache_a": ("int", "kCacheA", (0, 1, 2, 3, 4)),
+    "cache_b": ("int", "kCacheB", (0, 1, 2, 3, 4)),
+    "cache_pf": ("int", "kCachePf", (0, 1)),
+    "grf": ("int", "kGrf", (128, 256)),
+}
+KNOB_TAG = {"barrier_every": "be", "skip_idle": "si", "cache_a": "ca", "cache_b": "cb", "cache_pf": "cp", "grf": "g"}
 
 
 def production_configs():
-    """Production on PVC: choose_tile() = 256x256 for every call, default grid."""
-    return {k: dict(PRODUCTION_CFG) for k in KINDS} | {"extra_flags": []}
+    """Production on PVC (v4): per-kind configs above, default grid."""
+    return {k: dict(PRODUCTION_CFGS[k]) for k in KINDS} | {"extra_flags": []}
 
 
 class CandidateError(ValueError):
@@ -69,7 +100,20 @@ def load(path):
 def normalize(cfgs):
     out = {"extra_flags": list(cfgs.get("extra_flags", []))}
     for k in KINDS:
-        c = dict(PRODUCTION_CFG) | dict(cfgs.get(k, {}))
+        c = dict(PRODUCTION_CFGS[k]) | dict(cfgs.get(k, {}))
+        c = {x: v for x, v in c.items() if v is not None}       # None removes an inherited knob
+        for key, (_, _, allowed) in KNOB_MEMBERS.items():
+            if key in c:
+                v = c[key]
+                if key == "skip_idle":
+                    v = bool(v)
+                else:
+                    v = int(v)
+                if key == "barrier_every" and v < 1:
+                    raise CandidateError(f"{k}: barrier_every must be >= 1")
+                if allowed is not None and v not in allowed:
+                    raise CandidateError(f"{k}: {key}={v} not in {allowed}")
+                c[key] = v
         if "body" not in c:
             tm, tn, tk = (int(x) for x in c["tile"])
             sm, sn = (int(x) for x in c["sg"])
@@ -79,10 +123,22 @@ def normalize(cfgs):
                 raise CandidateError(f"{k}: sub-group tile {tm // sm}x{tn // sn} must be a multiple of 8x16 (DPAS)")
             if sm * sn > 64:
                 raise CandidateError(f"{k}: {sm * sn} sub-groups > 64 (1024 work-items)")
+            if sm * sn > 32 and c.get("grf", 256) == 256:
+                raise CandidateError(f"{k}: {sm * sn} sub-groups > 32 needs grf 128 (GRF-256 mode: 512 work-items max)")
             c["tile"], c["sg"], c["prefetch"] = [tm, tn, tk], [sm, sn], int(c["prefetch"])
         c["wgs"] = int(c.get("wgs", 0))
         out[k] = c
     return out
+
+
+def knob_desc(c):
+    """Short tag list of the optional knobs, e.g. 'be2 si ca2'."""
+    tags = []
+    for key, tag in KNOB_TAG.items():
+        if key in c:
+            v = c[key]
+            tags.append(tag if v is True else f"{tag}{int(v)}" if v is not False else f"{tag}0")
+    return " ".join(tags)
 
 
 def cfg_struct(name, c):
@@ -96,7 +152,13 @@ def cfg_struct(name, c):
                 f"  static constexpr int kTileN = {tn};\n"
                 f"  static constexpr int kTileK = {tk};\n"
                 f"  static constexpr int kPrefetchDist = {pf};\n"
-                f"  static constexpr const char* kDesc = \"{tm}x{tn}x{tk} sg{sm}x{sn} pf{pf}\";\n")
+                f"  static constexpr const char* kDesc = \"{tm}x{tn}x{tk} sg{sm}x{sn} pf{pf}"
+                + (" " + knob_desc(c) if knob_desc(c) else "") + "\";\n")
+    for key, (ctype, member, _) in KNOB_MEMBERS.items():
+        if key in c:
+            v = c[key]
+            lit = ("true" if v else "false") if ctype == "bool" else str(int(v))
+            body += f"  static constexpr {ctype} {member} = {lit};\n"
     if c.get("extra"):
         body += "  " + c["extra"].strip() + "\n"
     return ("#pragma once\n#include <cute/tensor.hpp>\nnamespace tune {\nusing namespace cute;\n"
