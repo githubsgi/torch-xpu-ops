@@ -110,3 +110,11 @@ Probe results on the v4 baseline (`all` suite, 2026-11-25; full table in
 default knobs 1.001x; `.st.ca` on A or B 0.999-1.002x (noise); dW barrier span 2 0.993x; `.uc.ca` on A 0.48x;
 L3-only prefetch 0.63x; GRF-128 with 64 sub-groups 0.46-0.65x. The knob operator therefore excludes the
 `.uc.*` hints, L3-only prefetch and GRF-128.
+
+Kernel Forge on the v4 baseline, 2026-11-25 (`seeds/v4_r1_n120`, `seeds/v4_r2_n027`, each with its
+`report.md`): round 1 (120 iterations, $38) best 1.0104x on `all`, re-run 1.0119x; round 2 seeded from it
+(150 iterations, $49) best 1.0157x. The gain is grad_weight (+4-7%: wave-tail split for `KGroupedKernel`,
+`Scheduler::locate_direct`, no split barrier in the dW mainloop) and grad_input (+2%: m_colB barrier span 1);
+forward +2-3% in round 2 from a 4x8 sub-group layout with a 4-way tail split. Below the 2% gate as a whole.
+The 4-case `search` suite misled on dW tile order (1.02x search, 0.91-0.97x full): use `small` or `full`
+for tile-order work.
