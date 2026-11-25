@@ -24,15 +24,19 @@ SG_TILE_N = (32, 64)
 PREFETCH = (1, 2, 3, 4)
 TILE_K = (16, 32, 64)
 BARRIER = (1, 2, 3, 4)
-CACHE = (0, 1, 2, 3, 4)          # default, ca.ca, st.ca, uc.ca, uc.uc
-CACHE_PF = (0, 1)                # ca.ca, uc.ca (L3 only)
-GRF = (256, 128)
+# Measured 2026-11-25 on the v4 baseline (notes_ggemm_kernel.md section 15): .uc.* hints (0.48x),
+# L3-only prefetch (0.63x) and GRF-128 (0.46-0.65x) are far below production, so the mutation
+# operator leaves them out; .ca.ca / .st.ca and GRF-256 stay. The LLM may still set them via
+# configs.json if it has a reason.
+CACHE = (0, 1, 2)                # default, ca.ca, st.ca
+CACHE_PF = (0,)                  # ca.ca only
+GRF = (256,)
 XE_CORES = 56
 WGS = (0, XE_CORES, 2 * XE_CORES, 3 * XE_CORES, 4 * XE_CORES)       # 0 = production rule
 KIND_WEIGHT = {"k_grouped": 0.4, "m_rowB": 0.3, "m_colB": 0.3}      # grad_weight is the weakest op
-ASPECT_WEIGHT = {"tile": 0.18, "sg": 0.08, "prefetch": 0.14, "tile_k": 0.08, "wgs": 0.08,
-                 "barrier": 0.10, "skip_idle": 0.04, "cache_a": 0.10, "cache_b": 0.10, "cache_pf": 0.05,
-                 "grf": 0.05}
+ASPECT_WEIGHT = {"tile": 0.22, "sg": 0.10, "prefetch": 0.16, "tile_k": 0.10, "wgs": 0.10,
+                 "barrier": 0.12, "skip_idle": 0.04, "cache_a": 0.08, "cache_b": 0.08, "cache_pf": 0.0,
+                 "grf": 0.0}
 # Only the kinds where the knob can matter: skip_idle needs partial tiles (M-grouped ragged rows).
 ASPECT_KINDS = {"skip_idle": ("m_rowB", "m_colB")}
 
@@ -117,11 +121,19 @@ def mutate(cfgs, rng, tries=30):
         elif aspect == "skip_idle":
             c["skip_idle"] = not c.get("skip_idle", False)
         elif aspect in ("cache_a", "cache_b"):
-            c[aspect] = _choice_ne(rng, CACHE, c.get(aspect, 0))
+            v = _choice_ne(rng, CACHE, c.get(aspect, 0))
+            if v is None:
+                continue
+            c[aspect] = v
         elif aspect == "cache_pf":
-            c["cache_pf"] = _choice_ne(rng, CACHE_PF, c.get("cache_pf", 0))
+            v = _choice_ne(rng, CACHE_PF, c.get("cache_pf", 0))
+            if v is None:
+                continue
+            c["cache_pf"] = v
         elif aspect == "grf":
             ng = 128 if grf == 256 else 256
+            if ng not in GRF:
+                continue
             sg = _pick_sg(rng, tm, tn, ng)          # the slab must fit the new register budget
             if not sg:
                 continue

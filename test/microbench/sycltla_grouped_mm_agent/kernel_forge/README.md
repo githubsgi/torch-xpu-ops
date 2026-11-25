@@ -104,3 +104,9 @@ GGEMM_NODES=<idle nodes> ~/miniforge3/bin/python3 -u -m kernel_forge.mcts \
     --workdir $GGEMM_AGENT_RUNS/kernel_forge/v4knobs --start-from kernel_forge/seeds/v4_knobs \
     --iterations 120 --workers 8 --knob-ratio 0.5 --suite search --final-suite all --model opus
 ```
+
+Probe results on the v4 baseline (`all` suite, 2026-11-25; full table in
+`~/datavol/logs/torchtitan/outputs_deepseek_v3_16b/notes_ggemm_kernel.md` section 15): extended header with
+default knobs 1.001x; `.st.ca` on A or B 0.999-1.002x (noise); dW barrier span 2 0.993x; `.uc.ca` on A 0.48x;
+L3-only prefetch 0.63x; GRF-128 with 64 sub-groups 0.46-0.65x. The knob operator therefore excludes the
+`.uc.*` hints, L3-only prefetch and GRF-128.
